@@ -1,4 +1,4 @@
-default: distillation_math.yaml
+defaults: distillation_math.yaml
 
 distillation:
     num_prompts_per_step: 128
@@ -24,6 +24,7 @@ policy:
 
     dtensor_cfg:
         tensor_parallel_size: 8
+        context_parallel_size: 1
 
     sequence_packing:
         enabled: true
@@ -36,6 +37,7 @@ teacher:
     model_name: "Qwen/Qwen3-32B"
     dtensor_cfg:
         tensor_parallel_size: 8
+        context_parallel_size: 1
 
 logger:
     wandb:
