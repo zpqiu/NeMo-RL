@@ -1,0 +1,43 @@
+default: distillation_math.yaml
+
+distillation:
+    num_prompts_per_step: 128
+    max_num_steps: 1000
+    val_batch_size: 512
+    val_period: 20
+    val_at_start: false
+    topk_logits_k: 64
+
+loss_fn:
+    kl_type: "reverse" # forward, reverse, mixed
+
+checkpointing:
+    checkpoint_dir: "checkpoints/distillation-ocv2-32B-${policy.model_name}"
+    save_period: 10
+
+policy:
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    tokenizer:
+        name: "Qwen/Qwen3-1.7B-Base" ## specify if you'd like to use a tokenizer different from the model's default
+    train_global_batch_size: 128
+    generation_batch_size: 128
+
+    dtensor_cfg:
+        tensor_parallel_size: 8
+
+    sequence_packing:
+        enabled: true
+
+    optimizer:
+        kwargs:
+            lr: 2.0e-5
+
+teacher:
+    model_name: "Qwen/Qwen3-32B"
+    dtensor_cfg:
+        tensor_parallel_size: 8
+
+logger:
+    wandb:
+        project: "alex-distillation"
+        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}-${loss_fn.zero_outside_topk}"

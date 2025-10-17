@@ -43,7 +43,7 @@ def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
 
     # Load hendrydong/aime24 dataset for validation
-    val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    val_ds = load_dataset("yentinglin/aime_2025", split="train")
 
     # Shuffle the training dataset with the specified seed
     train_ds = train_ds.shuffle(seed=seed)
