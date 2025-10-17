@@ -26,9 +26,6 @@ policy:
         tensor_parallel_size: 8
         context_parallel_size: 1
 
-    sequence_packing:
-        enabled: true
-
     optimizer:
         kwargs:
             lr: 2.0e-5
