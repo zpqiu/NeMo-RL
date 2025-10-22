@@ -21,6 +21,7 @@ policy:
         name: "Qwen/Qwen3-1.7B-Base" ## specify if you'd like to use a tokenizer different from the model's default
     train_global_batch_size: 128
     generation_batch_size: 128
+    max_total_sequence_length: 32768
 
     dtensor_cfg:
         tensor_parallel_size: 8
@@ -32,6 +33,7 @@ policy:
 
 teacher:
     model_name: "Qwen/Qwen3-32B"
+    max_total_sequence_length: 32768
     dtensor_cfg:
         tensor_parallel_size: 8
         context_parallel_size: 1
