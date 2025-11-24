@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
+from sympy import N
+
 import ray
 import torch
 from accelerate import init_empty_weights
@@ -24,6 +26,7 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
+from hqq.core.quantize import *
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -302,6 +305,126 @@ def load_weights(weights, model_runner):
         param_scale = torch.squeeze(param_scale, dim=-1)
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
+    # Finally load the weights into vllm
+    model.load_weights(weights_quantized)
+
+def _is_torchao_weight(name, model):
+    if name not in fp8_state.seen_params:
+        fp8_state.seen_params.add(name)
+        # Filter out bias params
+        if name.endswith("weight"):
+            module = _get_module_from_param_name(model, name)
+            # We currently only quantize linear layers
+            if isinstance(module, LinearBase):
+                fp8_state.fp8_param_names.add(name)
+    return name in fp8_state.fp8_param_names
+
+def torchao_quantize_param_data(param: torch.Tensor,
+                                torchao_config) -> torch.nn.Parameter:
+    """Quantize a Tensor with torchao quantization specified by torchao_config
+
+    Args:
+        param: weight parameter of the linear module
+        torchao_config: type of quantization and their arguments we want to
+            use to quantize the Tensor
+    """
+    from torchao.core.config import AOBaseConfig
+    from torchao.quantization import quantize_
+
+    assert isinstance(torchao_config, AOBaseConfig), f"{torchao_config}"
+    """
+    Avoid real weight allocation for faster load, since we will
+    end up setting it to param.
+    """
+    with torch.device("meta"):
+        # linear can't be top level module since quantize_ is inplace
+        # while some of our configs need to do module swap, and only non-top
+        # level modules support module swap
+        dummy_linear = torch.nn.Sequential(
+            torch.nn.Linear(param.shape[1], param.shape[0], bias=False))
+
+    dummy_linear[0].weight = torch.nn.Parameter(param, requires_grad=False)
+    quantize_(dummy_linear, torchao_config)
+    nw = dummy_linear[0].weight
+    print(nw.tensor_data_names)
+    return nw
+
+def hqq_quantize(param: torch.Tensor, hqq_config) -> torch.nn.Parameter:
+    dummy_layer = torch.nn.Linear(param.shape[1], param.shape[0], bias=False, device=param.device)
+    dummy_layer.weight = torch.nn.Parameter(param, requires_grad=False)
+    hqq_layer = HQQLinear(dummy_layer, quant_config=hqq_config, compute_dtype=torch.bfloat16, device=param.device, initialize=True, del_orig=True)
+    return hqq_layer.state_dict()
+
+
+def rtn_quantize(tensor: torch.Tensor, num_bits: int,
+                 group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a tensor using per-group static scaling factor.
+
+    Args:
+        tensor: The input tensor.
+        num_bits: Target precision for the result (supported values are
+                  8 or 4).
+        group_size: Quantization granularity. 
+                    If equal to -1, each row in the input tensor is treated
+                    as one group.
+    """
+    batch_present = len(tensor.shape) == 3
+    if not batch_present:
+        tensor = tensor.unsqueeze(0)
+
+    q_range = 2**num_bits
+    num_groups = (tensor.shape[1] * tensor.shape[2] //
+                  group_size if group_size != -1 else tensor.shape[1])
+    """Calculate a scaling factor per input group.
+    """
+    input_flat = tensor.reshape(tensor.shape[0], num_groups, -1)
+    input_min = torch.min(input_flat, dim=2, keepdim=True)[0]
+    input_max = torch.max(input_flat, dim=2, keepdim=True)[0]
+    input_max_abs = torch.max(input_min.abs(), input_max.abs())
+    scale = (input_max_abs * 2.0 / (q_range - 1))
+    """Scale each input group, round to the nearest integer, shift 
+    the range and truncate.
+    """
+    scaled_input = input_flat / scale
+    scaled_input = scaled_input.round()
+    scaled_input += q_range // 2
+    scaled_input = scaled_input.clamp(0, q_range - 1)
+
+    scale = scale.reshape(tensor.shape[0], tensor.shape[1], -1).contiguous()
+    inputs_q = scaled_input.reshape(tensor.shape).to(torch.uint8)
+    inputs_q = inputs_q.contiguous()
+
+    if num_bits == 4:
+        """Pack two 4-bit values into each byte.
+        """
+        inputs_q = (inputs_q[:, :, 1::2] << 4) | (inputs_q[:, :, ::2] & 0xf)
+        inputs_q = inputs_q.reshape(tensor.shape[0], tensor.shape[1] // 2,
+                                    tensor.shape[2])
+        inputs_q = inputs_q.contiguous()
+
+    if not batch_present:
+        inputs_q = inputs_q.squeeze(0)
+        scale = scale.squeeze(0)
+
+    return inputs_q, scale
+
+def torchao_load_weights(weights, model_runner):
+    """Load weights into the model."""
+    weights_quantized = []
+    model = model_runner.model
+
+    # from torchao.quantization import Int4WeightOnlyConfig
+    # base_config = Int4WeightOnlyConfig(group_size=32, version=2)
+    quant_config = BaseQuantizeConfig(nbits=4, group_size=64)
+    for k, v in weights:
+        print(f"@@ Loading weight {k} with v {v.shape}")
+        if not _is_torchao_weight(k, model):
+            weights_quantized.append((k, v))
+            continue
+        print(f"@@ Quantizing weight {k} with v {v.shape}")
+        new_state_dict = hqq_quantize(v, quant_config)
+        for new_k, v in new_state_dict.items():
+            weights_quantized.append((k[:-len("weight")]+new_k, v))
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 

@@ -438,7 +438,7 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    # generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}

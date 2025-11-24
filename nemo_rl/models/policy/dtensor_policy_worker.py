@@ -85,6 +85,8 @@ from nemo_rl.utils.native_checkpoint import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
+from torchao.quantization import quantize_, Int4WeightOnlyConfig
+from torchao.quantization.qat import QATConfig
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -261,6 +263,8 @@ class DTensorPolicyWorker:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
             model_class = resolve_model_class(model_config.model_type)
 
+        base_config = Int4WeightOnlyConfig(group_size=64, version=2)
+
         full_state_dict = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
@@ -281,6 +285,9 @@ class DTensorPolicyWorker:
                 model_config,
                 trust_remote_code=True,
             )
+            quantize_(self.model, QATConfig(base_config, step="prepare"))
+            if self.rank == 0:
+                print(self.model)
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id

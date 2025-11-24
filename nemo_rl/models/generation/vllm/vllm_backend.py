@@ -147,7 +147,8 @@ class VllmInternalWorkerExtension:
                     # the fp8 load_weights additionally casts bf16 weights into fp8
                     fp8.load_weights(weights, self.model_runner)
                 else:
-                    self.model_runner.model.load_weights(weights=weights)
+                    # self.model_runner.model.load_weights(weights=weights)
+                    fp8.torchao_load_weights(weights, self.model_runner)
 
                 torch.cuda.current_stream().synchronize()
 

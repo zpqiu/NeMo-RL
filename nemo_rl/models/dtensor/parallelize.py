@@ -257,10 +257,10 @@ def _parallelize_qwen(
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.self_attn.o_proj": ColwiseParallel(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+            "model.layers.*.mlp.down_proj": ColwiseParallel(),
         }
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
