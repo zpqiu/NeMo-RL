@@ -8,7 +8,7 @@ distillation:
     max_num_steps: 1000
     max_num_epochs: 10
     val_batch_size: 512
-    val_period:10
+    val_period: 10
     val_at_start: true
     max_val_samples: 512
     topk_logits_k: 64
