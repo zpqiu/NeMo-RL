@@ -64,6 +64,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
+from transformers import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLMoeForConditionalGeneration,
+)
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
@@ -196,10 +200,19 @@ def _parallelize_llama(
 
 
 def _parallelize_qwen(
-    model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
+    model: Union[
+        Qwen2ForCausalLM,
+        Qwen3ForCausalLM,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
+    ],
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Qwen2ForCausalLM model across data and tensor parallel dimensions."""
+    if isinstance(model, (Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration)):
+        model_prefix = "model.language_model"
+    else:
+        model_prefix = "model"
 
     class Qwen3QKNorm(SequenceParallel):
         @staticmethod
@@ -226,23 +239,23 @@ def _parallelize_qwen(
                 output_layouts=Shard(-1),
                 use_local_output=False,
             ),
-            "model.embed_tokens": RowwiseParallel(
+            f"{model_prefix}.embed_tokens": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
             ),
-            "model.rotary_emb": RotaryEmbedParallel(),
-            "model.norm": SequenceParallel(),
-            "model.layers.*.input_layernorm": SequenceParallel(),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-            "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
-            "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
-            "model.layers.*.post_attention_layernorm": SequenceParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+            f"{model_prefix}.rotary_emb": RotaryEmbedParallel(),
+            f"{model_prefix}.norm": SequenceParallel(),
+            f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
+            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
+            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
+            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+            f"{model_prefix}.layers.*.self_attn.q_norm": Qwen3QKNorm(),
+            f"{model_prefix}.layers.*.self_attn.k_norm": Qwen3QKNorm(),
+            f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
+            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
         }
 
     else:
@@ -250,16 +263,16 @@ def _parallelize_qwen(
             "lm_head": ColwiseParallel(
                 output_layouts=Shard(-1), use_local_output=False
             ),
-            "model.embed_tokens": RowwiseParallel(
+            f"{model_prefix}.embed_tokens": RowwiseParallel(
                 input_layouts=Replicate(),
             ),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
         }
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
@@ -270,6 +283,8 @@ PARALLIZE_FUNCTIONS: dict[
 ] = {
     Qwen2ForCausalLM: _parallelize_qwen,
     Qwen3ForCausalLM: _parallelize_qwen,
+    Qwen3VLForConditionalGeneration: _parallelize_qwen,
+    Qwen3VLMoeForConditionalGeneration: _parallelize_qwen,
     LlamaForCausalLM: _parallelize_llama,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     Gemma3ForCausalLM: _parallelize_gemma3,
@@ -327,6 +342,8 @@ def get_hf_tp_plan(model: PreTrainedModel):
     if model_cls in [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
     ]:
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
@@ -474,6 +491,8 @@ def _parallelize_model(
     model: Union[
         Qwen2ForCausalLM,
         Qwen3ForCausalLM,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
         LlamaForCausalLM,
         Gemma3ForCausalLM,
         Gemma3ForConditionalGeneration,
@@ -539,6 +558,8 @@ def _parallelize_model(
     elif model_cls in [
         Qwen2_5_VLForConditionalGeneration,
         Qwen2VLForConditionalGeneration,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
     ]:
         # VL models have the language model at model.language_model
         layers: list = []

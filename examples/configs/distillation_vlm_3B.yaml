@@ -1,0 +1,127 @@
+defaults: distillation_math.yaml
+
+# Distillation Algorithm Configuration
+distillation:
+    num_prompts_per_step: 128
+    num_generations_per_prompt: 1
+    max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_num_steps: 1000
+    max_num_epochs: 10
+    val_batch_size: 512
+    val_period:10
+    val_at_start: true
+    max_val_samples: 512
+    topk_logits_k: 64
+    seed: 42
+
+loss_fn:
+    kl_type: "reverse" # forward, reverse, mixed
+    zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+
+policy:
+    model_name: "Qwen/Qwen3-VL-2B-Instruct"
+    tokenizer:
+        name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
+        chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    train_global_batch_size: 128
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 8192
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
+
+    dtensor_cfg:
+        enabled: true
+        _v2: false
+        cpu_offload: False
+        sequence_parallel: false
+        activation_checkpointing: false
+        tensor_parallel_size: 1
+        context_parallel_size: 1
+        custom_parallel_plan: null
+    generation:
+        backend: "vllm"
+        max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
+        temperature: 1.0
+        top_p: 1.0
+        top_k: null
+        stop_token_ids: null
+        stop_strings: null
+        vllm_cfg:
+            async_engine: false
+            precision: ${...precision}
+            kv_cache_dtype: "auto"
+            tensor_parallel_size: 1
+            pipeline_parallel_size: 1
+            expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+            gpu_memory_utilization: 0.6
+            max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
+            enforce_eager: False
+            use_deep_gemm: False
+            num_last_layers_in_bf16: 0
+            num_first_layers_in_bf16: 0
+            distributed_executor_backend: null
+            # VLMs require tokenizer to be initialized before generation, so we set skip_tokenizer_init to False.
+            skip_tokenizer_init: False
+
+        colocated:
+            # true: generation shares training GPUs
+            # false: uses dedicated generation resources
+            enabled: true
+            # only relevant when enabled is false
+            resources:
+                gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+                num_nodes: null # Decides number of nodes to be dedicated to generation
+
+teacher:
+    model_name: "Qwen/Qwen3-VL-8B-Thinking"
+    dtensor_cfg:
+        _v2: false
+        context_parallel_size: 1 
+        tensor_parallel_size: 2
+
+data:
+    max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+    prompt_file: "examples/prompts/geo3k.txt"
+    system_prompt_file: null
+    dataset_name: "geometry3k"
+    env_name: "geometry3k"
+    split: "train"
+    shuffle: true
+    num_workers: 1
+
+env:
+    clevr-cogent:
+        num_workers: 8
+        reward_functions:
+            - name: format
+              weight: 0.2
+            - name: exact_alnum
+              weight: 0.8
+    geometry3k:
+        num_workers: 8
+        reward_functions:
+            - name: format
+              weight: 0.1
+            - name: math_expr
+              weight: 0.9
+    refcoco:
+        num_workers: 8
+        reward_functions:
+            - name: format
+              weight: 0.1
+            - name: bbox_giou
+              weight: 0.9
+              kwargs: 
+                  giou_penalty_thres: 0.5
+
+logger:
+    wandb:
+        project: "nemo-vlm-distillation"
+        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1
