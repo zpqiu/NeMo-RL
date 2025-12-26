@@ -1358,11 +1358,11 @@ def print_message_log_samples(
     def safe_render(content: str, role_color: str) -> str:
         # Fix common problematic patterns that might break Rich markup
         # Replace any standalone [/ without matching closing bracket
-        content = content.replace("[/", "\\[/")
+        content = str(content).replace("[/", "\\[/")
         # Replace any standalone [ that isn't followed by a valid tag with escaped version
         import re
 
-        content = re.sub(r"\[(?![a-z_]+\s|/[a-z_]+\])", "\\[", content)
+        content = re.sub(r"\[(?![a-z_]+\s|/[a-z_]+\])", "\\[", str(content))
         return f"[{role_color}]{content}[/]"
 
     # Extract messages from a message log
@@ -1372,6 +1372,9 @@ def print_message_log_samples(
             if role == "SYSTEM":
                 return f"[bold #8A2BE2]{role}:[/] {safe_render(content, '#8A2BE2')}"
             elif role == "USER":
+                # handle vlm input message format: [{"type": ..}, {"type": ..}, ...]
+                if isinstance(content, list):
+                    content = "\n".join([f"{item['text']}" for item in content if item.get("type", None) == "text"])
                 return f"[bold #4682B4]{role}:[/] {safe_render(content, '#4682B4')}"
             elif role == "ASSISTANT":
                 return f"[bold #2E8B57]{role}:[/] {safe_render(content, '#2E8B57')}"
