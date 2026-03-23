@@ -95,6 +95,7 @@ export SETUP_COMMAND
 
 # ---- Build the run command ----
 export COMMAND="date ; \
+    PYTHONPATH=${SNAPSHOT_DIR}\${PYTHONPATH:+:\$PYTHONPATH} \
     NRL_WG_USE_RAY_REF=1 \
     VLLM_CACHE_ROOT=${VLLM_CACHE_DIR} \
     DG_JIT_CACHE_DIR=${VLLM_CACHE_DIR}/deep_gemm \
