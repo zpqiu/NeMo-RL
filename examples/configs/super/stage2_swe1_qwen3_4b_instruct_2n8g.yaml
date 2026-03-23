@@ -45,6 +45,12 @@ policy:
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: false
+    # Qwen3-4B has no MTP head. Megatron's GPT postprocess currently gates on
+    # `mtp_num_layers is not None`, so inherited `0` still enters MTP loss code.
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: null
+    mtp_detach_heads: false
 
     optimizer:
       optimizer: "adam"
