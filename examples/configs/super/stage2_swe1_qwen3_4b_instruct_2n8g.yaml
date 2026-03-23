@@ -109,12 +109,10 @@ policy:
       enable_thinking: false
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
-        tool_parser: qwen3_coder
-        reasoning_parser: nano_v3
-        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
-        chat_template_kwargs:
-          enable_thinking: false
-          truncate_history_thinking: true
+        tool_parser: hermes
+        # chat_template_kwargs:
+        #   enable_thinking: false
+        #   truncate_history_thinking: true
     colocated:
       enabled: false
       resources:
