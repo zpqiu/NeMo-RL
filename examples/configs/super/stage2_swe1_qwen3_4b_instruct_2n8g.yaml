@@ -32,16 +32,16 @@ policy:
 
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
+    empty_unused_memory_level: 0
     activation_checkpointing: true
     converter_type: "Qwen3ForCausalLM"
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 1
+    context_parallel_size: 2
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: false
