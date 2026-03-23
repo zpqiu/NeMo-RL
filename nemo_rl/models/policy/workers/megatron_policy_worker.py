@@ -375,9 +375,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 # Update parameters.
                 if not eval_mode:
-                    # Debug: check if backward pass corrupted GPU memory
-                    torch.cuda.synchronize()
-                    print(f"[DEBUG] CUDA sync OK before optimizer.step(), rank={parallel_state.get_data_parallel_rank()}", flush=True)
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
@@ -1136,12 +1133,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.model.train()
 
         # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
+        # Must match the unconditional offload in offload_before_refit()
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
             self.move_optimizer("cuda")
 
