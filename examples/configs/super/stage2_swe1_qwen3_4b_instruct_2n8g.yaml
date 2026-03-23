@@ -25,13 +25,58 @@ policy:
   logprob_chunk_size: 512
 
   dtensor_cfg:
-    enabled: true
+    enabled: false
     activation_checkpointing: true
     tensor_parallel_size: 4
     context_parallel_size: 2
 
   megatron_cfg:
-    enabled: false
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "Qwen3ForCausalLM"
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 100000
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
 
   dynamic_batching:
     enabled: true
@@ -39,29 +84,11 @@ policy:
   sequence_packing:
     enabled: false
 
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
-  optimizer:
-    name: "torch.optim.AdamW"
-    kwargs:
-      lr: 1.0e-6
-      weight_decay: 0.0
-      betas: [0.9, 0.999]
-      eps: 1e-8
-      foreach: false
-      fused: false
+  optimizer: null
 
-  scheduler:
-    - name: "torch.optim.lr_scheduler.LinearLR"
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 10
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: [10]
+  scheduler: null
 
   generation:
     max_new_tokens: 2048
