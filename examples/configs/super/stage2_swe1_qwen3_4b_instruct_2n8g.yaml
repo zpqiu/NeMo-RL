@@ -35,13 +35,13 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     converter_type: "Qwen3ForCausalLM"
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 2
+    context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: false
@@ -119,7 +119,6 @@ policy:
         gpus_per_node: 8
         num_nodes: 1
 
-
 env:
   should_use_nemo_gym: true
   nemo_gym:
@@ -127,8 +126,8 @@ env:
     port_range_low: 15001
     port_range_high: 20000
     config_paths:
-    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
     policy_model:
       responses_api_models:
         vllm_model:
