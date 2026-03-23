@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
 import time
 import warnings
@@ -224,6 +225,7 @@ def _default_grpo_save_state() -> GRPOSaveState:
 
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
+    num_train_samples_to_print: NotRequired[int]  # number of train rollout samples to print to stdout
 
 
 class MasterConfig(TypedDict):
@@ -1049,6 +1051,98 @@ def extract_initial_prompt_messages(
         initial_prompt_message_logs.append(initial_prompt_log)
 
     return initial_prompt_message_logs
+
+
+def _truncate_debug_text(value: str, max_chars: int = 1200) -> str:
+    value = value.strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n...[truncated]..."
+
+
+def _format_debug_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return _truncate_debug_text(content)
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            else:
+                try:
+                    text_parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+                except TypeError:
+                    text_parts.append(repr(item))
+        return _truncate_debug_text("\n".join(part for part in text_parts if part))
+    if content is None:
+        return ""
+    return _truncate_debug_text(repr(content))
+
+
+def print_train_rollout_samples(
+    message_logs: list,
+    rewards: Any,
+    step: int,
+    num_samples: int = 1,
+) -> None:
+    """Print a few rollout samples before optimization for debugging."""
+    if num_samples <= 0 or not message_logs:
+        return
+
+    if isinstance(rewards, torch.Tensor):
+        rewards_list = rewards.detach().cpu().tolist()
+    elif isinstance(rewards, np.ndarray):
+        rewards_list = rewards.tolist()
+    else:
+        rewards_list = list(rewards)
+
+    num_to_show = min(num_samples, len(message_logs), len(rewards_list))
+    print("\n" + "=" * 100, flush=True)
+    print(f"DEBUG TRAIN ROLLOUT SAMPLES BEFORE STEP {step}", flush=True)
+    print("=" * 100, flush=True)
+
+    for sample_idx in range(num_to_show):
+        message_log = message_logs[sample_idx]
+        reward = rewards_list[sample_idx]
+        print(
+            f"\n[Sample {sample_idx + 1}/{num_to_show}] total_reward={reward}",
+            flush=True,
+        )
+        print("-" * 100, flush=True)
+        for turn_idx, message in enumerate(message_log):
+            role = message.get("role", "unknown")
+            token_ids = message.get("token_ids")
+            token_len = len(token_ids) if token_ids is not None else "n/a"
+            flags = []
+            if message.get("tool_calls"):
+                flags.append("tool_calls")
+            if message.get("is_invalid_tool_call", False):
+                flags.append("invalid_tool_call")
+            if message.get("has_malformed_thinking", False):
+                flags.append("malformed_thinking")
+            if "generation_logprobs" in message:
+                flags.append("generated")
+            flag_suffix = f" [{' | '.join(flags)}]" if flags else ""
+            print(
+                f"[Turn {turn_idx + 1}/{len(message_log)}] role={role} token_len={token_len}{flag_suffix}",
+                flush=True,
+            )
+            if message.get("tool_calls"):
+                try:
+                    tool_calls_text = json.dumps(
+                        list(message["tool_calls"]), ensure_ascii=False, indent=2
+                    )
+                except TypeError:
+                    tool_calls_text = repr(message["tool_calls"])
+                print("tool_calls:", flush=True)
+                print(_truncate_debug_text(tool_calls_text), flush=True)
+            content = _format_debug_message_content(message.get("content"))
+            if content:
+                print("content:", flush=True)
+                print(content, flush=True)
+            print("-" * 100, flush=True)
+
+    print("=" * 100 + "\n", flush=True)
 
 
 def dynamic_sampling(
@@ -3193,6 +3287,14 @@ def async_grpo_train(
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
+                    )
+                    print_train_rollout_samples(
+                        repeated_batch["message_log"],
+                        rewards,
+                        step=step + 1,
+                        num_samples=master_config["logger"].get(
+                            "num_train_samples_to_print", 0
+                        ),
                     )
 
                 # Prepare training data (same as sync version)
