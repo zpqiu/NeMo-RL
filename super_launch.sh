@@ -95,6 +95,7 @@ export SETUP_COMMAND
 
 # ---- Build the run command ----
 export COMMAND="date ; \
+    CUDA_LAUNCH_BLOCKING=1 \
     PYTHONPATH=${SNAPSHOT_DIR}\${PYTHONPATH:+:\$PYTHONPATH} \
     NRL_WG_USE_RAY_REF=1 \
     VLLM_CACHE_ROOT=${VLLM_CACHE_DIR} \
