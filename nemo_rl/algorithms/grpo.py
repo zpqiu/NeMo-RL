@@ -1053,11 +1053,20 @@ def extract_initial_prompt_messages(
     return initial_prompt_message_logs
 
 
-def _truncate_debug_text(value: str, max_chars: int = 1200) -> str:
+def _truncate_debug_text(
+    value: str, max_chars: int = 1200, tail_chars: int = 300
+) -> str:
     value = value.strip()
     if len(value) <= max_chars:
         return value
-    return value[:max_chars] + "\n...[truncated]..."
+    if tail_chars <= 0 or tail_chars >= max_chars:
+        return value[:max_chars] + "\n...[truncated]..."
+    head_chars = max_chars - tail_chars
+    return (
+        value[:head_chars]
+        + "\n...[truncated]...\n"
+        + value[-tail_chars:]
+    )
 
 
 def _format_debug_message_content(content: Any) -> str:
@@ -1079,10 +1088,40 @@ def _format_debug_message_content(content: Any) -> str:
     return _truncate_debug_text(repr(content))
 
 
+def _decode_debug_message_tokens(
+    tokenizer: Any, token_ids: Any, role: str
+) -> str:
+    if tokenizer is None or token_ids is None:
+        return ""
+
+    if hasattr(token_ids, "detach"):
+        token_ids = token_ids.detach().cpu().tolist()
+    elif hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+
+    if not token_ids:
+        return ""
+
+    try:
+        decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+    except Exception:
+        return ""
+
+    if not decoded.strip():
+        return ""
+
+    # Prompts can be extremely long in SWE. Show both head and tail so we can
+    # quickly spot truncation or malformed template sections.
+    max_chars = 2400 if role == "user" else 1600
+    tail_chars = 700 if role == "user" else 300
+    return _truncate_debug_text(decoded, max_chars=max_chars, tail_chars=tail_chars)
+
+
 def print_train_rollout_samples(
     message_logs: list,
     rewards: Any,
     step: int,
+    tokenizer: Any = None,
     num_samples: int = 1,
 ) -> None:
     """Print a few rollout samples before optimization for debugging."""
@@ -1140,6 +1179,13 @@ def print_train_rollout_samples(
             if content:
                 print("content:", flush=True)
                 print(content, flush=True)
+            else:
+                decoded_text = _decode_debug_message_tokens(
+                    tokenizer, token_ids, role
+                )
+                if decoded_text:
+                    print("decoded_from_token_ids:", flush=True)
+                    print(decoded_text, flush=True)
             print("-" * 100, flush=True)
 
     print("=" * 100 + "\n", flush=True)
@@ -3292,6 +3338,7 @@ def async_grpo_train(
                         repeated_batch["message_log"],
                         rewards,
                         step=step + 1,
+                        tokenizer=tokenizer,
                         num_samples=master_config["logger"].get(
                             "num_train_samples_to_print", 0
                         ),
