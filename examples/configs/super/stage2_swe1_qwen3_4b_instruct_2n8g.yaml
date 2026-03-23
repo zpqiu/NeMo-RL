@@ -1,0 +1,78 @@
+defaults: ./stage2_swe1.yaml
+
+# Dense Qwen3-4B initial Stage 2.1 config:
+# one 8-GPU node for FSDP2 training and one 8-GPU node for non-colocated vLLM generation.
+
+checkpointing:
+  checkpoint_dir: "results/qwen3_4b_instruct_stage2_swe1_2n8g"
+  save_period: 10
+
+grpo:
+  num_prompts_per_step: 32
+
+policy:
+  model_name: "Qwen/Qwen3-4B-Instruct-2507"
+  train_global_batch_size: 512
+  max_total_sequence_length: 16384
+  logprob_chunk_size: 1024
+
+  dtensor_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: true
+
+  sequence_packing:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 10
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [10]
+
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      tensor_parallel_size: 1
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.8
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+logger:
+  log_dir: "logs/qwen3_4b_instruct_stage2_swe1_2n8g"
+  wandb:
+    project: "super-v3-posttraining"
+    name: "qwen3-4b-instruct-stage2-swe1-2n8g"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
