@@ -64,7 +64,7 @@ policy:
       adam_beta2: 0.999
       adam_eps: 1e-8
       sgd_momentum: 0.9
-      use_distributed_optimizer: true
+      use_distributed_optimizer: false
       use_precision_aware_optimizer: true
       clip_grad: ${policy.max_grad_norm}
 
