@@ -375,6 +375,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 # Update parameters.
                 if not eval_mode:
+                    # Debug: check if backward pass corrupted GPU memory
+                    torch.cuda.synchronize()
+                    print(f"[DEBUG] CUDA sync OK before optimizer.step(), rank={parallel_state.get_data_parallel_rank()}", flush=True)
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
