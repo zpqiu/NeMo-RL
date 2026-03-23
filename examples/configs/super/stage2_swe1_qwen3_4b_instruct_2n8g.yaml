@@ -79,10 +79,14 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
 
   dynamic_batching:
-    enabled: true
+    enabled: false
 
   sequence_packing:
-    enabled: false
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
 
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
