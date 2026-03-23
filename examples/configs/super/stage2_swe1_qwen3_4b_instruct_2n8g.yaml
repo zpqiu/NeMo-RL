@@ -8,13 +8,15 @@ checkpointing:
   save_period: 10
 
 grpo:
-  num_prompts_per_step: 32
+  num_prompts_per_step: 8
 
 policy:
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
-  train_global_batch_size: 512
-  max_total_sequence_length: 16384
-  logprob_chunk_size: 1024
+  train_global_batch_size: 128
+  # SWE pivot prompts can expand dramatically once tool schemas and chat formatting
+  # are included in the actual request sent to vLLM.
+  max_total_sequence_length: 65536
+  logprob_chunk_size: 2048
 
   dtensor_cfg:
     enabled: true
@@ -56,11 +58,11 @@ policy:
     - milestones: [10]
 
   generation:
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 8192
     vllm_cfg:
       tensor_parallel_size: 1
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.7
     colocated:
       enabled: false
       resources:
