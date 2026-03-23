@@ -8,11 +8,8 @@ checkpointing:
   save_period: 10
 
 grpo:
-  num_prompts_per_step: 4
-  num_generations_per_prompt: 4
-  use_dynamic_sampling: true
-  dynamic_sampling_max_gen_batches: 10
-  batch_multiplier: 2
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
 
 policy:
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
@@ -20,7 +17,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs:
       enable_thinking: false
-  train_global_batch_size: 16
+  train_global_batch_size: 64
   generation_batch_size: 8
   # SWE pivot prompts can expand dramatically once tool schemas and chat formatting
   # are included in the actual request sent to vLLM.
