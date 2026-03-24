@@ -37,7 +37,6 @@ try:
 
     _HAS_NEMO_RL = True
 except ImportError:
-    # Standalone mode — define minimal stubs for testing without nemo_rl
     import enum
 
     class LossType(enum.Enum):
@@ -64,14 +63,12 @@ except ImportError:
 # ===================================================================
 
 class CrossTokenizerDistillationLossConfig(TypedDict):
-    """Configuration for cross-tokenizer distillation loss."""
-
-    kl_type: str  # "forward", "reverse", or "mixed"
-    mixed_kl_weight: float  # weight for forward KL in mixed mode (0-1)
+    kl_type: str
+    mixed_kl_weight: float
 
 
 # ===================================================================
-# Core KL computation (shared between both implementations)
+# Core KL computation
 # ===================================================================
 
 def _compute_chunk_kl(
@@ -80,17 +77,6 @@ def _compute_chunk_kl(
     kl_type: str,
     mixed_kl_weight: float = 0.5,
 ) -> torch.Tensor:
-    """Per-chunk KL divergence.
-
-    Args:
-        teacher_chunk_logprobs: ``(num_chunks,)``
-        student_chunk_logprobs: ``(num_chunks,)``
-        kl_type: "forward", "reverse", or "mixed"
-        mixed_kl_weight: weight for forward KL in mixed mode
-
-    Returns:
-        ``(num_chunks,)`` — per-chunk KL values.
-    """
     teacher_p = teacher_chunk_logprobs.exp()
     student_p = student_chunk_logprobs.exp()
 
@@ -106,16 +92,10 @@ def _compute_chunk_kl(
 
 
 # ===================================================================
-# 1) Standalone loss — for unit tests and external use
+# 1) Standalone loss
 # ===================================================================
 
 class CrossTokenizerDistillationLossFn:
-    """Chunk-level KL divergence for cross-tokenizer distillation.
-
-    Standalone version — called directly with lists of pre-computed chunk
-    logprobs.  Not compatible with ``Policy.train()``.
-    """
-
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 
@@ -125,11 +105,7 @@ class CrossTokenizerDistillationLossFn:
         assert self.kl_type in ("forward", "reverse", "mixed")
         assert 0 <= self.mixed_kl_weight <= 1
 
-    def compute_chunk_kl(
-        self,
-        teacher_chunk_logprobs: torch.Tensor,
-        student_chunk_logprobs: torch.Tensor,
-    ) -> torch.Tensor:
+    def compute_chunk_kl(self, teacher_chunk_logprobs, student_chunk_logprobs):
         return _compute_chunk_kl(
             teacher_chunk_logprobs, student_chunk_logprobs,
             self.kl_type, self.mixed_kl_weight,
@@ -176,27 +152,17 @@ class CrossTokenizerDistillationLossFn:
 
 
 # ===================================================================
-# 2) NeMo RL-compatible loss — for Policy.train()
+# 2) NeMo RL-compatible loss
 # ===================================================================
 
 class CrossTokenizerTrainLossFn:
     """Cross-tokenizer distillation loss compatible with ``Policy.train()``.
 
-    This loss function receives ``next_token_logprobs`` (student per-token
-    logprobs from the forward pass) and aggregates them into chunk-level
-    logprobs using alignment info packed into the ``data`` dict.
-
-    **Expected data dict keys** (packed by the algorithm before calling
-    ``Policy.train()``):
-
-    - ``input_ids``: (B, S) student input ids
-    - ``input_lengths``: (B,) prompt lengths
-    - ``token_mask``: (B, S) mask for generated tokens
-    - ``sample_mask``: (B,) per-sample mask
-    - ``xalign_teacher_chunk_logprobs``: (B, S) padded teacher chunk logprobs
+    **Expected data dict keys** (all padded to (B, S)):
+    - ``xalign_teacher_chunk_logprobs``: (B, S) teacher chunk logprobs
     - ``xalign_chunk_student_start``: (B, S) start index of student tokens per chunk
-    - ``xalign_chunk_mask``: (B, S) which positions are valid chunks
-    - ``xalign_num_student_toks``: (B, S) number of consecutive student tokens per chunk
+    - ``xalign_chunk_mask``: (B, S) valid chunk mask
+    - ``xalign_num_student_toks``: (B, S) count of consecutive student tokens per chunk
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -216,73 +182,68 @@ class CrossTokenizerTrainLossFn:
         next_token_logprobs: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute cross-tokenizer chunk-level KL loss.
-
-        Args:
-            data: BatchedDataDict with alignment info + teacher chunk logprobs.
-            global_valid_seqs: global normalization factor for sequence-level.
-            global_valid_toks: global normalization factor for token-level.
-            next_token_logprobs: (B, S-1) student per-token logprobs from forward pass.
-
-        Returns:
-            (loss, metrics)
-        """
-        assert next_token_logprobs is not None, "next_token_logprobs is required"
+        assert next_token_logprobs is not None
 
         batch_size = next_token_logprobs.shape[0]
         device = next_token_logprobs.device
 
-        # Alignment data is (B, S) padded — chunk info in first positions
-        teacher_chunk_lps = data["xalign_teacher_chunk_logprobs"].to(device)  # (B, S)
-        chunk_student_start = data["xalign_chunk_student_start"].to(device)  # (B, S)
-        chunk_mask = data["xalign_chunk_mask"].to(device)  # (B, S)
-        num_s_toks = data["xalign_num_student_toks"].to(device)  # (B, S)
-        input_lengths = data["input_lengths"].to(device)  # (B,)
+        teacher_chunk_lps = data["xalign_teacher_chunk_logprobs"].to(device)
+        chunk_student_start = data["xalign_chunk_student_start"].to(device)
+        chunk_mask = data["xalign_chunk_mask"].to(device)
+        num_s_toks = data["xalign_num_student_toks"].to(device)
+        input_lengths = data["input_lengths"].to(device)
 
-        max_chunks = teacher_chunk_lps.shape[1]
+        # Find max valid chunks to avoid iterating over all S positions
+        max_valid = int(chunk_mask.sum(dim=1).max().item()) if chunk_mask.sum() > 0 else 0
 
-        # Aggregate student logprobs into chunks
-        # next_token_logprobs is (B, S-1) — logprob of token[t+1] given [0..t]
-        # For generated token at position p (0-indexed in generation), the
-        # logprob is at next_token_logprobs[:, input_length + p - 1]
-        student_chunk_lps = torch.zeros_like(teacher_chunk_lps)  # (B, S)
-        seq_dim = teacher_chunk_lps.shape[1]
+        # Aggregate student logprobs into chunks with gradient flow
+        # Build student_chunk_lps as a list → stack to maintain autograd graph
+        all_student_chunk_lps = []
+        all_teacher_chunk_lps = []
+        all_chunk_valid = []
 
         for b in range(batch_size):
-            prompt_len = input_lengths[b].item()
-            for c in range(seq_dim):
+            prompt_len = int(input_lengths[b].item())
+            for c in range(max_valid):
                 if chunk_mask[b, c] == 0:
                     continue
                 n_toks = int(num_s_toks[b, c].item())
                 if n_toks == 0:
                     continue
-                # Student tokens are consecutive starting at chunk_student_start
                 start_idx = int(chunk_student_start[b, c].item())
-                s_indices = torch.arange(start_idx, start_idx + n_toks, device=device)
-                # Map to logprob indices: gen token at position p has logprob
-                # at next_token_logprobs[b, prompt_len - 1 + p]
-                lp_indices = (prompt_len - 1 + s_indices).long()
-                # Clamp to valid range
-                max_lp_idx = next_token_logprobs.shape[1] - 1
-                lp_indices = lp_indices.clamp(0, max_lp_idx)
-                student_chunk_lps[b, c] = next_token_logprobs[b, lp_indices].sum()
+                # Map generation token indices to logprob indices
+                lp_start = prompt_len - 1 + start_idx
+                lp_end = lp_start + n_toks
+                max_lp_idx = next_token_logprobs.shape[1]
+                lp_start = max(0, min(lp_start, max_lp_idx - 1))
+                lp_end = max(lp_start + 1, min(lp_end, max_lp_idx))
+                # Sum student logprobs for this chunk (preserves grad)
+                s_chunk_lp = next_token_logprobs[b, lp_start:lp_end].sum()
+                t_chunk_lp = teacher_chunk_lps[b, c]
 
-        # Compute KL divergence
+                all_student_chunk_lps.append(s_chunk_lp)
+                all_teacher_chunk_lps.append(t_chunk_lp)
+
+        if len(all_student_chunk_lps) == 0:
+            # No valid chunks — return zero loss
+            loss = next_token_logprobs.sum() * 0.0
+            return loss, {"loss": 0.0, "num_chunks": 0, "num_valid_samples": batch_size}
+
+        # Stack all chunks into flat tensors (grad flows through student side)
+        student_flat = torch.stack(all_student_chunk_lps)  # (N_chunks,)
+        teacher_flat = torch.stack(all_teacher_chunk_lps)  # (N_chunks,)
+
+        # Compute KL
         chunk_kl = _compute_chunk_kl(
-            teacher_chunk_lps, student_chunk_lps,
+            teacher_flat, student_flat,
             self.kl_type, self.mixed_kl_weight,
-        )  # (B, max_C)
+        )
 
-        # Masked mean over valid chunks
-        total_valid_chunks = chunk_mask.sum()
-        if total_valid_chunks > 0:
-            loss = (chunk_kl * chunk_mask).sum() / total_valid_chunks
-        else:
-            loss = chunk_kl.sum() * 0.0  # zero loss but keep grad
+        loss = chunk_kl.mean()
 
         metrics = {
             "loss": loss.item(),
-            "num_chunks": int(total_valid_chunks.item()),
+            "num_chunks": len(all_student_chunk_lps),
             "num_valid_samples": batch_size,
         }
 
