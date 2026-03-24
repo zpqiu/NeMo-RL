@@ -5,10 +5,10 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../../../..)
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=8
-STEPS_PER_RUN=10
-MAX_STEPS=10
+STEPS_PER_RUN=50
+MAX_STEPS=50
 NUM_RUNS=1
-NUM_MINUTES=60
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 set -eou pipefail
@@ -33,13 +33,14 @@ cd $PROJECT_ROOT
 uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     --config research/cross_tokenizer_distillation/configs/cross_distill_math.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
-    cross_distillation.num_prompts_per_step=16 \
+    cross_distillation.num_prompts_per_step=32 \
     cross_distillation.val_period=0 \
+    loss_fn.kl_type=reverse \
     policy.model_name=nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
     teacher.model_name=Qwen/Qwen3-4B-Base \
     policy.max_total_sequence_length=2048 \
-    policy.train_global_batch_size=16 \
-    policy.generation_batch_size=16 \
+    policy.train_global_batch_size=32 \
+    policy.generation_batch_size=32 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=False \
     logger.tensorboard_enabled=True \
