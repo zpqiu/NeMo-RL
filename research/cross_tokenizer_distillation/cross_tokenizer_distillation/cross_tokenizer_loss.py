@@ -233,11 +233,24 @@ class CrossTokenizerTrainLossFn:
         batch_size = next_token_logprobs.shape[0]
         device = next_token_logprobs.device
 
-        teacher_chunk_lps = data["teacher_chunk_logprobs"].to(device)  # (B, max_C)
-        chunk_student_idx = data["chunk_student_indices"].to(device)  # (B, max_C, max_T)
-        chunk_mask = data["chunk_mask"].to(device)  # (B, max_C)
-        num_s_toks = data["num_student_toks_per_chunk"].to(device)  # (B, max_C)
-        input_lengths = data["input_lengths"].to(device)  # (B,)
+        # Unflatten alignment data (stored as 1D to bypass check_sequence_dim)
+        xalign_bs = data["xalign_batch_size"]
+        max_chunks = data["xalign_max_chunks"]
+        max_toks = data["xalign_max_toks_per_chunk"]
+
+        # Handle both int and tensor metadata
+        if isinstance(xalign_bs, torch.Tensor):
+            xalign_bs = int(xalign_bs.item())
+        if isinstance(max_chunks, torch.Tensor):
+            max_chunks = int(max_chunks.item())
+        if isinstance(max_toks, torch.Tensor):
+            max_toks = int(max_toks.item())
+
+        teacher_chunk_lps = data["xalign_teacher_chunk_logprobs"].to(device).reshape(xalign_bs, max_chunks)
+        chunk_student_idx = data["xalign_chunk_student_indices"].to(device).reshape(xalign_bs, max_chunks, max_toks)
+        chunk_mask = data["xalign_chunk_mask"].to(device).reshape(xalign_bs, max_chunks)
+        num_s_toks = data["xalign_num_student_toks_per_chunk"].to(device).reshape(xalign_bs, max_chunks)
+        input_lengths = data["input_lengths"].to(device)
 
         max_chunks = teacher_chunk_lps.shape[1]
 

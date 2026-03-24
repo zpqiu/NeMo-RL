@@ -230,10 +230,14 @@ class TestTrainLoss:
             "input_lengths": torch.tensor([prompt_len]),
             "token_mask": torch.ones(1, total_seq_len, dtype=torch.long),
             "sample_mask": torch.ones(1, dtype=torch.float32),
-            "teacher_chunk_logprobs": teacher_chunk_lps.unsqueeze(0),
-            "chunk_student_indices": chunk_student_idx,
-            "chunk_mask": torch.ones(1, n_chunks),
-            "num_student_toks_per_chunk": num_s_toks,
+            # Flattened alignment data (matching algorithm.py format)
+            "xalign_teacher_chunk_logprobs": teacher_chunk_lps.unsqueeze(0).reshape(-1),
+            "xalign_chunk_student_indices": chunk_student_idx.reshape(-1),
+            "xalign_chunk_mask": torch.ones(1, n_chunks).reshape(-1),
+            "xalign_num_student_toks_per_chunk": num_s_toks.reshape(-1),
+            "xalign_batch_size": 1,
+            "xalign_max_chunks": n_chunks,
+            "xalign_max_toks_per_chunk": max_toks,
         }
 
         # Simulate next_token_logprobs from forward pass
