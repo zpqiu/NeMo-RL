@@ -781,7 +781,7 @@ def cross_tokenizer_distillation_train(
                 metrics.update(train_results.get("all_mb_metrics", {}))
                 metrics.update(rollout_metrics)
 
-                total_valid_tokens += int(alignment_data["chunk_mask"].sum().item())
+                total_valid_tokens += int(alignment_data["xalign_chunk_mask"].sum().item())
 
                 # Checkpointing
                 consumed_samples += distill_config["num_prompts_per_step"]
@@ -830,7 +830,7 @@ def cross_tokenizer_distillation_train(
             train_loss = metrics.get("loss", float("nan"))
             print(f"\n📊 Step {total_steps + 1} Results:")
             print(f"  • Loss (chunk KL): {train_loss:.4f}")
-            print(f"  • Chunks: {int(alignment_data['chunk_mask'].sum().item())}")
+            print(f"  • Chunks: {int(alignment_data['xalign_chunk_mask'].sum().item())}")
             print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
             print(f"\n⏱️  Timing: {total_time:.2f}s total", flush=True)
 
