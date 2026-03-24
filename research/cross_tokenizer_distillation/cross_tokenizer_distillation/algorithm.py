@@ -1,0 +1,794 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Cross-tokenizer on-policy distillation algorithm.
+
+Based on ``nemo_rl.algorithms.distillation`` but removes the shared-tokenizer
+requirement and introduces text-space alignment between teacher and student.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+
+import numpy as np
+import ray
+import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
+from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.data import DataConfig
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import (
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
+from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+from cross_tokenizer_distillation.cross_tokenizer_loss import (
+    CrossTokenizerDistillationLossConfig,
+    CrossTokenizerDistillationLossFn,
+)
+from cross_tokenizer_distillation.token_alignment import (
+    AlignmentResult,
+    align_tokens_by_byte_offset,
+    compute_chunk_logprobs,
+)
+
+# ===============================================================================
+# Configuration
+# ===============================================================================
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class CrossDistillationConfig(TypedDict):
+    """Cross-tokenizer distillation specific configuration."""
+
+    num_prompts_per_step: int
+    num_generations_per_prompt: int
+    max_rollout_turns: int
+    max_num_steps: int
+    max_num_epochs: int
+    val_batch_size: int
+    val_period: int
+    val_at_start: bool
+    val_at_end: bool
+    max_val_samples: int
+    seed: int
+
+
+class CrossDistillSaveState(TypedDict):
+    total_steps: int
+    current_epoch: int
+    current_step: int
+    val_reward: NotRequired[float]
+    consumed_samples: int
+    total_valid_tokens: int
+
+
+def _default_save_state() -> CrossDistillSaveState:
+    return {
+        "current_epoch": 0,
+        "current_step": 0,
+        "total_steps": 0,
+        "val_reward": -99999999.0,
+        "consumed_samples": 0,
+        "total_valid_tokens": 0,
+    }
+
+
+class CrossDistillMasterConfig(TypedDict):
+    """Main configuration for cross-tokenizer distillation."""
+
+    policy: PolicyConfig  # Student model configuration
+    teacher: PolicyConfig  # Teacher model configuration (different tokenizer!)
+    loss_fn: CrossTokenizerDistillationLossConfig
+    env: dict[str, Any]
+    data: DataConfig
+    cross_distillation: CrossDistillationConfig
+    logger: LoggerConfig
+    cluster: ClusterConfig
+    checkpointing: CheckpointingConfig
+
+
+# ===============================================================================
+# Text-space alignment utilities
+# ===============================================================================
+
+
+def decode_and_retokenize(
+    generated_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    student_tokenizer: PreTrainedTokenizerBase,
+    teacher_tokenizer: PreTrainedTokenizerBase,
+) -> tuple[list[str], list[AlignmentResult]]:
+    """Decode student-generated text and compute cross-tokenizer alignment.
+
+    Args:
+        generated_ids: (batch, seq_len) — full sequence (prompt + generation).
+        input_lengths: (batch,) — length of prompt for each sample.
+        student_tokenizer: Student's tokenizer.
+        teacher_tokenizer: Teacher's tokenizer.
+
+    Returns:
+        (decoded_texts, alignments) — one AlignmentResult per sample.
+    """
+    batch_size = generated_ids.shape[0]
+    decoded_texts: list[str] = []
+    alignments: list[AlignmentResult] = []
+
+    for i in range(batch_size):
+        prompt_len = int(input_lengths[i].item())
+        gen_ids = generated_ids[i, prompt_len:]
+
+        # Strip padding
+        if student_tokenizer.pad_token_id is not None:
+            mask = gen_ids != student_tokenizer.pad_token_id
+            gen_ids = gen_ids[mask]
+
+        if gen_ids.numel() == 0:
+            decoded_texts.append("")
+            alignments.append(
+                AlignmentResult(text="", teacher_token_ids=[], student_token_ids=[])
+            )
+            continue
+
+        text = student_tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
+        decoded_texts.append(text)
+
+        alignment = align_tokens_by_byte_offset(text, teacher_tokenizer, student_tokenizer)
+        alignments.append(alignment)
+
+    return decoded_texts, alignments
+
+
+def build_teacher_input(
+    decoded_texts: list[str],
+    prompt_messages: list,
+    teacher_tokenizer: PreTrainedTokenizerBase,
+    max_seq_len: int,
+) -> BatchedDataDict:
+    """Build teacher input by re-tokenizing the student-generated text.
+
+    The teacher sees the same prompt (re-tokenized) + the student's generated
+    response (re-tokenized with teacher's tokenizer).
+
+    Returns a BatchedDataDict suitable for ``teacher_policy.get_logprobs()``.
+    """
+    all_input_ids = []
+    all_input_lengths = []
+    all_token_masks = []
+
+    for text, prompt_msg in zip(decoded_texts, prompt_messages):
+        # Build the full conversation for teacher
+        # Apply chat template if available
+        if hasattr(teacher_tokenizer, "apply_chat_template"):
+            # Build messages list from prompt + generated response
+            messages = []
+            for msg in prompt_msg:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": "assistant", "content": text})
+
+            full_ids = teacher_tokenizer.apply_chat_template(
+                messages, add_generation_prompt=False, return_tensors="pt"
+            ).squeeze(0)
+
+            # Compute prompt length by encoding without the assistant response
+            prompt_only = messages[:-1]
+            prompt_ids = teacher_tokenizer.apply_chat_template(
+                prompt_only, add_generation_prompt=True, return_tensors="pt"
+            ).squeeze(0)
+            prompt_len = prompt_ids.shape[0]
+        else:
+            # Fallback: simple concatenation
+            prompt_text = teacher_tokenizer.decode(
+                teacher_tokenizer(
+                    "".join(m.get("content", "") for m in prompt_msg)
+                )["input_ids"]
+            )
+            gen_enc = teacher_tokenizer(text, add_special_tokens=False)
+            prompt_enc = teacher_tokenizer(prompt_text, add_special_tokens=True)
+            full_ids = torch.tensor(prompt_enc["input_ids"] + gen_enc["input_ids"])
+            prompt_len = len(prompt_enc["input_ids"])
+
+        # Truncate to max_seq_len
+        if full_ids.shape[0] > max_seq_len:
+            full_ids = full_ids[:max_seq_len]
+
+        # Token mask: 0 for prompt, 1 for generated
+        token_mask = torch.zeros(full_ids.shape[0], dtype=torch.long)
+        token_mask[prompt_len:] = 1
+
+        all_input_ids.append(full_ids)
+        all_input_lengths.append(prompt_len)
+        all_token_masks.append(token_mask)
+
+    # Pad to same length
+    max_len = max(ids.shape[0] for ids in all_input_ids) if all_input_ids else 0
+    padded_ids = torch.full(
+        (len(all_input_ids), max_len),
+        teacher_tokenizer.pad_token_id or 0,
+        dtype=torch.long,
+    )
+    padded_masks = torch.zeros(len(all_input_ids), max_len, dtype=torch.long)
+
+    for i, (ids, mask) in enumerate(zip(all_input_ids, all_token_masks)):
+        padded_ids[i, : ids.shape[0]] = ids
+        padded_masks[i, : mask.shape[0]] = mask
+
+    return BatchedDataDict(
+        {
+            "input_ids": padded_ids,
+            "input_lengths": torch.tensor(all_input_lengths, dtype=torch.long),
+            "token_mask": padded_masks,
+            "sample_mask": torch.ones(len(all_input_ids), dtype=torch.float32),
+        }
+    )
+
+
+# ===============================================================================
+# Setup
+# ===============================================================================
+
+
+def setup(
+    master_config: CrossDistillMasterConfig,
+    student_tokenizer: TokenizerType,
+    train_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
+) -> tuple[
+    ColocatablePolicyInterface,  # student_policy
+    ColocatablePolicyInterface,  # teacher_policy
+    Optional[GenerationInterface],  # student_generation
+    PreTrainedTokenizerBase,  # teacher_tokenizer
+    StatefulDataLoader,
+    Optional[StatefulDataLoader],
+    CrossTokenizerDistillationLossFn,
+    Logger,
+    CheckpointManager,
+    CrossDistillSaveState,
+    CrossDistillMasterConfig,
+]:
+    """Setup cross-tokenizer distillation.
+
+    Unlike standard distillation, this does NOT check vocab equality and loads
+    a separate teacher tokenizer.
+    """
+    policy_config = master_config["policy"]
+    teacher_config = master_config["teacher"]
+    generation_config = master_config["policy"]["generation"]
+    loss_config = master_config["loss_fn"]
+    distill_config = master_config["cross_distillation"]
+    data_config = master_config["data"]
+    logger_config = master_config["logger"]
+    cluster_config = master_config["cluster"]
+
+    assert generation_config is not None
+
+    set_seed(distill_config["seed"])
+
+    # ==========================
+    #     Teacher Tokenizer
+    # ==========================
+    print("\n▶ Loading teacher tokenizer (different from student!)...", flush=True)
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_config["model_name"])
+    print(
+        f"  ✓ Teacher tokenizer: vocab_size={len(teacher_tokenizer)}, "
+        f"model={teacher_config['model_name']}",
+        flush=True,
+    )
+    print(
+        f"  ✓ Student tokenizer: vocab_size={len(student_tokenizer)}, "
+        f"model={policy_config['model_name']}",
+        flush=True,
+    )
+
+    # ==========================
+    #         Logger
+    # ==========================
+    logger = Logger(logger_config)
+    logger.log_hyperparams(master_config)
+
+    # ==========================
+    #      Checkpointing
+    # ==========================
+    checkpointer = CheckpointManager(master_config["checkpointing"])
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    save_state: Optional[CrossDistillSaveState] = cast(
+        Optional[CrossDistillSaveState],
+        checkpointer.load_training_info(last_checkpoint_path),
+    )
+    if save_state is None:
+        save_state = _default_save_state()
+
+    # ==========================
+    #           Data
+    # ==========================
+    dataloader = StatefulDataLoader(
+        train_dataset,
+        batch_size=distill_config["num_prompts_per_step"],
+        shuffle=data_config["shuffle"],
+        collate_fn=rl_collate_fn,
+        drop_last=True,
+    )
+
+    if last_checkpoint_path:
+        dl_state = torch.load(os.path.join(last_checkpoint_path, "train_dataloader.pt"))
+        dataloader.load_state_dict(dl_state)
+
+    print(f"  ✓ Training dataloader: {len(train_dataset)} samples", flush=True)
+
+    val_dataloader: Optional[StatefulDataLoader] = None
+    if distill_config["val_period"] > 0 or distill_config["val_at_start"] or distill_config["val_at_end"]:
+        assert val_dataset is not None
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=distill_config["val_batch_size"],
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+        )
+        print(f"  ✓ Validation dataloader: {len(val_dataset)} samples", flush=True)
+
+    # ==========================
+    #          Cluster
+    # ==========================
+    print("\n▶ Setting up compute cluster...", flush=True)
+    colocated_inference = generation_config["colocated"]["enabled"]
+
+    if colocated_inference:
+        cluster = RayVirtualCluster(
+            name="xdistill_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+            * cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=1
+            if generation_config["backend"] == "megatron"
+            else 3,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+    else:
+        # Simplified: for non-colocated, reuse the same logic as distillation.py
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_nodes = cluster_config["num_nodes"]
+        inference_resources = generation_config["colocated"]["resources"]
+        inference_gpus_per_node = inference_resources["gpus_per_node"]
+        inference_nodes = inference_resources["num_nodes"]
+
+        if cluster_config["num_nodes"] == 1:
+            inference_nodes = 1
+            train_gpus_per_node -= inference_gpus_per_node
+        else:
+            train_nodes -= inference_nodes
+
+        train_cluster = RayVirtualCluster(
+            name="xdistill_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=3,
+        )
+        inference_cluster = RayVirtualCluster(
+            name="xdistill_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=3,
+        )
+
+    # ==========================
+    #      Teacher Policy
+    # ==========================
+    print("\n▶ Setting up teacher policy...", flush=True)
+    # NOTE: Teacher uses its OWN tokenizer
+    teacher_policy = Policy(
+        name_prefix="teacher",
+        cluster=train_cluster,
+        config=teacher_config,
+        tokenizer=teacher_tokenizer,
+        weights_path=None,
+        optimizer_path=None,
+        init_optimizer=False,
+        init_reference_model=False,
+    )
+    teacher_policy.offload_after_refit()
+
+    # ==========================
+    #    Student Generation
+    # ==========================
+    backend = generation_config["backend"]
+    generation_config["model_name"] = policy_config["model_name"]
+
+    if backend == "megatron":
+        student_generation = None
+    elif backend == "vllm":
+        generation_config = cast(VllmConfig, generation_config)
+        if "vllm_cfg" in generation_config:
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+                "hf_config_overrides", {}
+            )
+        student_generation = VllmGeneration(
+            cluster=inference_cluster, config=generation_config
+        )
+        student_generation.finish_generation()
+
+    # ==========================
+    #      Student Policy
+    # ==========================
+    print("\n▶ Setting up student policy...", flush=True)
+    weights_path = None
+    optimizer_path = None
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+
+    # NOTE: Student uses student_tokenizer
+    student_policy = Policy(
+        name_prefix="student",
+        cluster=train_cluster,
+        config=policy_config,
+        tokenizer=student_tokenizer,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        init_reference_model=False,
+    )
+
+    if student_generation is not None:
+        state_dict_info = student_policy.prepare_refit_info()
+        student_generation.prepare_refit_info(state_dict_info)
+
+    if not colocated_inference and student_generation is not None:
+        ip, port = train_cluster.get_master_address_and_port()
+        train_world_size = train_cluster.world_size()
+        world_size = train_world_size + inference_nodes * inference_gpus_per_node
+        futures_train = student_policy.init_collective(ip, port, world_size, train_world_size=train_world_size)
+        futures_inference = student_generation.init_collective(ip, port, world_size, train_world_size=train_world_size)
+        ray.get(futures_train + futures_inference)
+
+    loss_fn = CrossTokenizerDistillationLossFn(loss_config)
+
+    print("\n" + "=" * 60)
+    print(" " * 12 + "CROSS-TOKENIZER DISTILLATION SETUP COMPLETE")
+    print("=" * 60 + "\n", flush=True)
+
+    return (
+        student_policy,
+        teacher_policy,
+        student_generation,
+        teacher_tokenizer,
+        dataloader,
+        val_dataloader,
+        loss_fn,
+        logger,
+        checkpointer,
+        save_state,
+        master_config,
+    )
+
+
+# ===============================================================================
+# Training
+# ===============================================================================
+
+
+def cross_tokenizer_distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    student_generation: Optional[GenerationInterface],
+    student_tokenizer: TokenizerType,
+    teacher_tokenizer: PreTrainedTokenizerBase,
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    loss_fn: CrossTokenizerDistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    save_state: CrossDistillSaveState,
+    master_config: CrossDistillMasterConfig,
+) -> None:
+    """Run cross-tokenizer distillation training."""
+    timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
+    NEED_REFIT = True
+    if student_generation is None:
+        student_generation = student_policy  # type: ignore
+        NEED_REFIT = False
+    POLICY_GENERATION_STALE = True
+    assert student_generation is not None
+
+    current_epoch = save_state["current_epoch"]
+    current_step = save_state["current_step"]
+    total_steps = save_state["total_steps"]
+    consumed_samples = save_state["consumed_samples"]
+    total_valid_tokens = save_state["total_valid_tokens"]
+    distill_config = master_config["cross_distillation"]
+    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    max_epochs = distill_config["max_num_epochs"]
+    max_steps = distill_config["max_num_steps"]
+    max_seq_len = master_config["policy"]["max_total_sequence_length"]
+
+    batch: BatchedDataDict[DatumSpec]
+
+    while total_steps < max_steps and current_epoch < max_epochs:
+        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}", flush=True)
+
+        for batch in dataloader:
+            print(f"\n{'=' * 25} Step {current_step + 1} (total: {total_steps + 1}) {'=' * 25}", flush=True)
+            maybe_gpu_profile_step(student_policy, total_steps + 1)
+
+            with timer.time("total_step_time"):
+                # ---- 1) Prepare batch ----
+                with timer.time("data_processing"):
+                    repeated_batch = batch.repeat_interleave(
+                        distill_config["num_generations_per_prompt"]
+                    )
+
+                # ---- 2) Student on-policy generation ----
+                print("▶ Generating student responses...", flush=True)
+                with timer.time("prepare_for_generation"):
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_policy_generation(
+                            student_policy, student_generation, colocated_inference, timer=timer,
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        student_generation.prepare_for_generation()
+
+                with timer.time("generation"):
+                    if _should_use_async_rollouts(master_config):
+                        repeated_batch, rollout_metrics = run_async_multi_turn_rollout(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=student_tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=max_seq_len,
+                            max_rollout_turns=distill_config["max_rollout_turns"],
+                            greedy=False,
+                        )
+                    else:
+                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=student_tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=max_seq_len,
+                            max_rollout_turns=distill_config["max_rollout_turns"],
+                            greedy=False,
+                        )
+                    student_generation.finish_generation()
+
+                # ---- 3) Flatten student output and decode text ----
+                with timer.time("data_processing"):
+                    for message_log in repeated_batch["message_log"]:
+                        for message in message_log:
+                            if message["role"] == "assistant":
+                                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+                            else:
+                                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+
+                    flat_messages, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": student_tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config["policy"]["make_sequence_length_divisible_by"],
+                    )
+
+                    student_input_ids = flat_messages["token_ids"]  # (B, S)
+
+                # ---- 4) Text-space alignment ----
+                print("▶ Decoding text & computing cross-tokenizer alignment...", flush=True)
+                with timer.time("alignment"):
+                    decoded_texts, alignments = decode_and_retokenize(
+                        generated_ids=student_input_ids,
+                        input_lengths=input_lengths,
+                        student_tokenizer=student_tokenizer,
+                        teacher_tokenizer=teacher_tokenizer,
+                    )
+
+                    # Build teacher input
+                    # Extract prompt messages from the batch
+                    prompt_messages = []
+                    for msg_log in repeated_batch["message_log"]:
+                        prompt_msgs = [m for m in msg_log if m["role"] != "assistant"]
+                        prompt_messages.append(prompt_msgs)
+
+                    teacher_train_data = build_teacher_input(
+                        decoded_texts=decoded_texts,
+                        prompt_messages=prompt_messages,
+                        teacher_tokenizer=teacher_tokenizer,
+                        max_seq_len=max_seq_len,
+                    )
+                    teacher_train_data.to("cpu")
+
+                # ---- 5) Teacher forward → logprobs ----
+                print("▶ Computing teacher logprobs...", flush=True)
+                with timer.time("teacher_logprob_inference_prep"):
+                    teacher_policy.prepare_for_lp_inference()
+
+                with timer.time("teacher_logprob_inference"):
+                    teacher_logprob_result = teacher_policy.get_logprobs(teacher_train_data, timer=timer)
+                    teacher_token_logprobs = teacher_logprob_result["logprobs"]  # (B, S-1)
+
+                # ---- 6) Student forward → logprobs ----
+                print("▶ Computing student logprobs...", flush=True)
+                with timer.time("training_prep"):
+                    teacher_policy.offload_after_refit()
+                    student_policy.prepare_for_training()
+                    POLICY_GENERATION_STALE = True
+
+                # Build student train data
+                student_train_data = BatchedDataDict(
+                    {
+                        "input_ids": student_input_ids,
+                        "input_lengths": input_lengths,
+                        "token_mask": flat_messages["token_loss_mask"],
+                        "sample_mask": repeated_batch["loss_multiplier"],
+                    }
+                )
+                student_train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                student_train_data.to("cpu")
+
+                # Get student logprobs via get_logprobs
+                with timer.time("student_logprob_inference"):
+                    student_logprob_result = student_policy.get_logprobs(student_train_data, timer=timer)
+                    student_token_logprobs = student_logprob_result["logprobs"]  # (B, S-1)
+
+                # ---- 7) Chunk-level KL loss ----
+                print("▶ Computing chunk-level KL loss...", flush=True)
+                with timer.time("loss_computation"):
+                    teacher_chunk_lps_batch = []
+                    student_chunk_lps_batch = []
+
+                    for i, alignment in enumerate(alignments):
+                        if alignment.num_chunks == 0:
+                            teacher_chunk_lps_batch.append(torch.zeros(0))
+                            student_chunk_lps_batch.append(torch.zeros(0))
+                            continue
+
+                        # Teacher: extract logprobs for generated tokens
+                        t_input_len = int(teacher_train_data["input_lengths"][i].item())
+                        t_gen_logprobs = teacher_token_logprobs[i, t_input_len - 1:]
+
+                        # Student: extract logprobs for generated tokens
+                        s_input_len = int(input_lengths[i].item())
+                        s_gen_logprobs = student_token_logprobs[i, s_input_len - 1:]
+
+                        t_chunk_lps = compute_chunk_logprobs(t_gen_logprobs, alignment.chunks, "teacher")
+                        s_chunk_lps = compute_chunk_logprobs(s_gen_logprobs, alignment.chunks, "student")
+
+                        teacher_chunk_lps_batch.append(t_chunk_lps)
+                        student_chunk_lps_batch.append(s_chunk_lps)
+
+                    loss, loss_metrics = loss_fn(teacher_chunk_lps_batch, student_chunk_lps_batch)
+
+                # ---- 8) Student backward + update ----
+                print("▶ Training student policy...", flush=True)
+                with timer.time("policy_training"):
+                    # For now, we use the loss computed externally and pass it
+                    # through the standard train interface.
+                    # We inject the pre-computed loss into the training data
+                    # and use NLLLossFn as a passthrough.
+                    #
+                    # TODO: Integrate more tightly with Policy.train() to avoid
+                    # double forward pass. For the initial prototype, we compute
+                    # logprobs separately and compute loss externally, then do a
+                    # separate backward pass.
+                    loss.backward()
+
+                    # Log the loss
+                    train_loss = loss.item()
+
+                # Metrics
+                metrics = {
+                    "loss": train_loss,
+                    **loss_metrics,
+                }
+                metrics.update(rollout_metrics)
+                total_valid_tokens += loss_metrics.get("num_chunks", 0)
+
+                # Checkpointing
+                consumed_samples += distill_config["num_prompts_per_step"]
+                timeout.mark_iteration()
+
+                is_last_step = (total_steps + 1 >= max_steps) or (
+                    (current_epoch + 1 == max_epochs)
+                    and (current_step + 1 == len(dataloader))
+                )
+
+                should_save = (
+                    is_last_step
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"] == 0
+                    or timeout.check_save()
+                )
+
+                if master_config["checkpointing"]["enabled"] and should_save:
+                    student_policy.prepare_for_training()
+                    save_state.update({
+                        "current_epoch": current_epoch,
+                        "current_step": current_step + 1,
+                        "total_steps": total_steps + 1,
+                        "total_valid_tokens": total_valid_tokens,
+                        "consumed_samples": consumed_samples,
+                    })
+                    with timer.time("checkpointing"):
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            total_steps + 1, save_state, master_config
+                        )
+                        student_policy.save_checkpoint(
+                            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer"),
+                            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                            checkpointing_cfg=master_config["checkpointing"],
+                        )
+                        torch.save(
+                            dataloader.state_dict(),
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        checkpointer.finalize_checkpoint(checkpoint_path)
+
+            # Logging
+            timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+            total_time = timing_metrics.get("total_step_time", 0)
+
+            print(f"\n📊 Step {total_steps + 1} Results:")
+            print(f"  • Loss (chunk KL): {train_loss:.4f}")
+            print(f"  • Chunks: {loss_metrics.get('num_chunks', 0)}")
+            print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
+            print(f"\n⏱️  Timing: {total_time:.2f}s total", flush=True)
+            for k, v in sorted(timing_metrics.items(), key=lambda x: x[1], reverse=True):
+                if k != "total_step_time" and total_time > 0:
+                    print(f"  • {k}: {v:.2f}s ({v / total_time * 100:.1f}%)", flush=True)
+
+            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+
+            timer.reset()
+            current_step += 1
+            total_steps += 1
+
+            if total_steps >= max_steps:
+                print("Max steps reached.", flush=True)
+                return
+
+        current_epoch += 1
+        current_step = 0

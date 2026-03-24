@@ -2,3 +2,4 @@ commit	step	status	tests	description
 ebe4083	1	keep	1	project skeleton
 bfb2ef4	2	keep	1	pyproject.toml + workspace member
 cfe403e	3-6	keep	11	token alignment module + tests (all pass)
+ab75e02	7-8	keep	12	cross-tokenizer loss + tests (all pass)
