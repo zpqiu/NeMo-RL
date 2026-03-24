@@ -193,11 +193,10 @@ class CrossTokenizerTrainLossFn:
     - ``input_lengths``: (B,) prompt lengths
     - ``token_mask``: (B, S) mask for generated tokens
     - ``sample_mask``: (B,) per-sample mask
-    - ``teacher_chunk_logprobs``: (B, max_chunks) padded teacher chunk logprobs
-    - ``chunk_student_indices``: (B, max_chunks, max_toks_per_chunk) padded indices
-    - ``chunk_teacher_indices``: (B, max_chunks, max_toks_per_chunk) padded indices
-    - ``chunk_mask``: (B, max_chunks) which chunks are valid
-    - ``num_student_toks_per_chunk``: (B, max_chunks) number of student tokens per chunk
+    - ``xalign_teacher_chunk_logprobs``: (B, S) padded teacher chunk logprobs
+    - ``xalign_chunk_student_start``: (B, S) start index of student tokens per chunk
+    - ``xalign_chunk_mask``: (B, S) which positions are valid chunks
+    - ``xalign_num_student_toks``: (B, S) number of consecutive student tokens per chunk
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -233,24 +232,12 @@ class CrossTokenizerTrainLossFn:
         batch_size = next_token_logprobs.shape[0]
         device = next_token_logprobs.device
 
-        # Unflatten alignment data (stored as 1D to bypass check_sequence_dim)
-        xalign_bs = data["xalign_batch_size"]
-        max_chunks = data["xalign_max_chunks"]
-        max_toks = data["xalign_max_toks_per_chunk"]
-
-        # Handle both int and tensor metadata
-        if isinstance(xalign_bs, torch.Tensor):
-            xalign_bs = int(xalign_bs.item())
-        if isinstance(max_chunks, torch.Tensor):
-            max_chunks = int(max_chunks.item())
-        if isinstance(max_toks, torch.Tensor):
-            max_toks = int(max_toks.item())
-
-        teacher_chunk_lps = data["xalign_teacher_chunk_logprobs"].to(device).reshape(xalign_bs, max_chunks)
-        chunk_student_idx = data["xalign_chunk_student_indices"].to(device).reshape(xalign_bs, max_chunks, max_toks)
-        chunk_mask = data["xalign_chunk_mask"].to(device).reshape(xalign_bs, max_chunks)
-        num_s_toks = data["xalign_num_student_toks_per_chunk"].to(device).reshape(xalign_bs, max_chunks)
-        input_lengths = data["input_lengths"].to(device)
+        # Alignment data is (B, S) padded — chunk info in first positions
+        teacher_chunk_lps = data["xalign_teacher_chunk_logprobs"].to(device)  # (B, S)
+        chunk_student_start = data["xalign_chunk_student_start"].to(device)  # (B, S)
+        chunk_mask = data["xalign_chunk_mask"].to(device)  # (B, S)
+        num_s_toks = data["xalign_num_student_toks"].to(device)  # (B, S)
+        input_lengths = data["input_lengths"].to(device)  # (B,)
 
         max_chunks = teacher_chunk_lps.shape[1]
 
@@ -258,18 +245,20 @@ class CrossTokenizerTrainLossFn:
         # next_token_logprobs is (B, S-1) — logprob of token[t+1] given [0..t]
         # For generated token at position p (0-indexed in generation), the
         # logprob is at next_token_logprobs[:, input_length + p - 1]
-        student_chunk_lps = torch.zeros_like(teacher_chunk_lps)  # (B, max_C)
+        student_chunk_lps = torch.zeros_like(teacher_chunk_lps)  # (B, S)
+        seq_dim = teacher_chunk_lps.shape[1]
 
         for b in range(batch_size):
             prompt_len = input_lengths[b].item()
-            for c in range(max_chunks):
+            for c in range(seq_dim):
                 if chunk_mask[b, c] == 0:
                     continue
                 n_toks = int(num_s_toks[b, c].item())
                 if n_toks == 0:
                     continue
-                # Student token indices (0-indexed within generation)
-                s_indices = chunk_student_idx[b, c, :n_toks]
+                # Student tokens are consecutive starting at chunk_student_start
+                start_idx = int(chunk_student_start[b, c].item())
+                s_indices = torch.arange(start_idx, start_idx + n_toks, device=device)
                 # Map to logprob indices: gen token at position p has logprob
                 # at next_token_logprobs[b, prompt_len - 1 + p]
                 lp_indices = (prompt_len - 1 + s_indices).long()

@@ -214,30 +214,31 @@ class TestTrainLoss:
         teacher_chunk_lps = compute_chunk_logprobs(teacher_lps, alignment.chunks, "teacher")
         n_chunks = alignment.num_chunks
 
-        # Pack into tensors (batch_size=1)
-        max_toks = max(len(c.student_token_indices) for c in alignment.chunks)
-        chunk_student_idx = torch.zeros(1, n_chunks, max_toks, dtype=torch.long)
-        num_s_toks = torch.zeros(1, n_chunks, dtype=torch.long)
+        # Pack into (B, S) format matching algorithm.py
+        total_seq_len = prompt_len + n_student + 1
+        pad_dim = total_seq_len
+
+        xalign_teacher = torch.zeros(1, pad_dim)
+        xalign_teacher[0, :n_chunks] = teacher_chunk_lps
+        xalign_mask = torch.zeros(1, pad_dim)
+        xalign_mask[0, :n_chunks] = 1.0
+        xalign_num_toks = torch.zeros(1, pad_dim, dtype=torch.long)
+        xalign_start = torch.zeros(1, pad_dim, dtype=torch.long)
         for c_idx, chunk in enumerate(alignment.chunks):
             n_t = len(chunk.student_token_indices)
-            num_s_toks[0, c_idx] = n_t
-            chunk_student_idx[0, c_idx, :n_t] = torch.tensor(chunk.student_token_indices)
-
-        total_seq_len = prompt_len + n_student + 1  # +1 for safety
+            xalign_num_toks[0, c_idx] = n_t
+            if n_t > 0:
+                xalign_start[0, c_idx] = chunk.student_token_indices[0]
 
         data = {
             "input_ids": torch.randint(1, 100, (1, total_seq_len)),
             "input_lengths": torch.tensor([prompt_len]),
             "token_mask": torch.ones(1, total_seq_len, dtype=torch.long),
             "sample_mask": torch.ones(1, dtype=torch.float32),
-            # Flattened alignment data (matching algorithm.py format)
-            "xalign_teacher_chunk_logprobs": teacher_chunk_lps.unsqueeze(0).reshape(-1),
-            "xalign_chunk_student_indices": chunk_student_idx.reshape(-1),
-            "xalign_chunk_mask": torch.ones(1, n_chunks).reshape(-1),
-            "xalign_num_student_toks_per_chunk": num_s_toks.reshape(-1),
-            "xalign_batch_size": 1,
-            "xalign_max_chunks": n_chunks,
-            "xalign_max_toks_per_chunk": max_toks,
+            "xalign_teacher_chunk_logprobs": xalign_teacher,
+            "xalign_chunk_student_start": xalign_start,
+            "xalign_chunk_mask": xalign_mask,
+            "xalign_num_student_toks": xalign_num_toks,
         }
 
         # Simulate next_token_logprobs from forward pass

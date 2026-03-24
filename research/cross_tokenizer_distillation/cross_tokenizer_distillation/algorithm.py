@@ -178,22 +178,20 @@ def decode_and_align(
 def pack_alignment_into_data(
     alignments: list[AlignmentResult],
     teacher_gen_logprobs: list[torch.Tensor],
+    seq_len: int,
 ) -> dict[str, torch.Tensor]:
     """Pack alignment info + teacher chunk logprobs into tensors for Policy.train().
 
-    Creates padded tensors that can be added to the training BatchedDataDict.
+    All tensors are padded to (B, seq_len) to pass check_sequence_dim
+    and shard_by_batch_size validation.
 
     Args:
         alignments: List of AlignmentResult, one per sample.
         teacher_gen_logprobs: List of teacher per-token logprobs for generated tokens.
-            Each tensor has shape (num_teacher_gen_tokens,).
+        seq_len: Sequence length to pad to (matches input_ids shape[1]).
 
     Returns:
-        Dict of tensors to merge into train_data:
-        - teacher_chunk_logprobs: (B, max_C) padded
-        - chunk_student_indices: (B, max_C, max_T) padded student token indices
-        - chunk_mask: (B, max_C) valid chunk mask
-        - num_student_toks_per_chunk: (B, max_C)
+        Dict of tensors to merge into train_data.
     """
     batch_size = len(alignments)
 
@@ -215,21 +213,29 @@ def pack_alignment_into_data(
             sample_indices.append(chunk.student_token_indices)
         all_student_indices.append(sample_indices)
 
-    # Determine padding dimensions
-    max_chunks = max(lps.numel() for lps in all_teacher_chunk_lps) if all_teacher_chunk_lps else 0
-    max_toks = 1  # at least 1
+    # Max chunks and max tokens per chunk
+    max_chunks = max((lps.numel() for lps in all_teacher_chunk_lps), default=0)
+    max_toks = 1
     for sample_idx in all_student_indices:
         for chunk_idx in sample_idx:
             max_toks = max(max_toks, len(chunk_idx))
 
     if max_chunks == 0:
-        max_chunks = 1  # avoid zero-size tensors
+        max_chunks = 1
 
-    # Build padded tensors
-    teacher_chunk_logprobs = torch.zeros(batch_size, max_chunks)
-    chunk_student_indices = torch.zeros(batch_size, max_chunks, max_toks, dtype=torch.long)
-    chunk_mask = torch.zeros(batch_size, max_chunks)
-    num_student_toks = torch.zeros(batch_size, max_chunks, dtype=torch.long)
+    # Pad to (B, seq_len) — alignment data goes in first max_chunks positions
+    # Using seq_len ensures check_sequence_dim passes
+    pad_dim = seq_len  # Match sequence dimension
+
+    teacher_chunk_logprobs = torch.zeros(batch_size, pad_dim)
+    chunk_mask = torch.zeros(batch_size, pad_dim)
+    num_student_toks = torch.zeros(batch_size, pad_dim, dtype=torch.long)
+    # chunk_student_indices needs to be (B, pad_dim, max_toks) but that would
+    # fail check_sequence_dim. Instead, encode as (B, pad_dim) with a packed format.
+    # We'll store the first student token index for each chunk in a (B, pad_dim) tensor
+    # and the count in num_student_toks. For multi-token chunks, we store the start
+    # index and assume consecutive tokens (which is true by alignment construction).
+    chunk_student_start = torch.zeros(batch_size, pad_dim, dtype=torch.long)
 
     for i in range(batch_size):
         n_chunks = all_teacher_chunk_lps[i].numel()
@@ -242,20 +248,13 @@ def pack_alignment_into_data(
             n_t = len(s_idx)
             num_student_toks[i, c] = n_t
             if n_t > 0:
-                chunk_student_indices[i, c, :n_t] = torch.tensor(s_idx, dtype=torch.long)
+                chunk_student_start[i, c] = s_idx[0]
 
-    # Flatten all alignment tensors to 1D to bypass check_sequence_dim
-    # which validates that all multi-dim tensors share the sequence dimension.
-    # We unflatten them in the loss function using the metadata.
     return {
-        "xalign_teacher_chunk_logprobs": teacher_chunk_logprobs.reshape(-1),
-        "xalign_chunk_student_indices": chunk_student_indices.reshape(-1),
-        "xalign_chunk_mask": chunk_mask.reshape(-1),
-        "xalign_num_student_toks_per_chunk": num_student_toks.reshape(-1),
-        # Metadata stored as Python ints (not tensors)
-        "xalign_batch_size": batch_size,
-        "xalign_max_chunks": max_chunks,
-        "xalign_max_toks_per_chunk": max_toks,
+        "xalign_teacher_chunk_logprobs": teacher_chunk_logprobs,  # (B, S)
+        "xalign_chunk_student_start": chunk_student_start,  # (B, S)
+        "xalign_chunk_mask": chunk_mask,  # (B, S)
+        "xalign_num_student_toks": num_student_toks,  # (B, S)
     }
 
 
@@ -738,7 +737,10 @@ def cross_tokenizer_distillation_train(
                         t_gen_lps = teacher_token_logprobs[i, t_prompt_len - 1:]
                         teacher_gen_logprobs.append(t_gen_lps)
 
-                    alignment_data = pack_alignment_into_data(alignments, teacher_gen_logprobs)
+                    alignment_data = pack_alignment_into_data(
+                        alignments, teacher_gen_logprobs,
+                        seq_len=student_input_ids.shape[1],
+                    )
 
                 # ---- 7) Build student train_data and call Policy.train() ----
                 print("▶ Training student policy...", flush=True)
@@ -752,14 +754,11 @@ def cross_tokenizer_distillation_train(
                     "input_lengths": input_lengths,
                     "token_mask": flat_messages["token_loss_mask"],
                     "sample_mask": repeated_batch["loss_multiplier"],
-                    # Cross-tokenizer alignment data (flattened 1D to bypass check_sequence_dim)
+                    # Cross-tokenizer alignment data (padded to seq_len for compatibility)
                     "xalign_teacher_chunk_logprobs": alignment_data["xalign_teacher_chunk_logprobs"],
-                    "xalign_chunk_student_indices": alignment_data["xalign_chunk_student_indices"],
+                    "xalign_chunk_student_start": alignment_data["xalign_chunk_student_start"],
                     "xalign_chunk_mask": alignment_data["xalign_chunk_mask"],
-                    "xalign_num_student_toks_per_chunk": alignment_data["xalign_num_student_toks_per_chunk"],
-                    "xalign_batch_size": alignment_data["xalign_batch_size"],
-                    "xalign_max_chunks": alignment_data["xalign_max_chunks"],
-                    "xalign_max_toks_per_chunk": alignment_data["xalign_max_toks_per_chunk"],
+                    "xalign_num_student_toks": alignment_data["xalign_num_student_toks"],
                 })
                 train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
