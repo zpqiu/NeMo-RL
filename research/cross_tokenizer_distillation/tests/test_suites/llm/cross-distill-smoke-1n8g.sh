@@ -36,6 +36,7 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     cross_distillation.num_prompts_per_step=32 \
     cross_distillation.val_period=0 \
     loss_fn.kl_type=forward \
+    policy.optimizer.kwargs.lr=1e-6 \
     policy.model_name=nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
     teacher.model_name=Qwen/Qwen3-4B-Base \
     policy.max_total_sequence_length=2048 \
