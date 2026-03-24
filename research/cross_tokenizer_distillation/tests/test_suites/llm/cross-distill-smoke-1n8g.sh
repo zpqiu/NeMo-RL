@@ -8,7 +8,7 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=50
 MAX_STEPS=50
 NUM_RUNS=1
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 set -eou pipefail
@@ -23,7 +23,7 @@ JSON_METRICS=$EXP_DIR/metrics.json
 mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 
 export PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/research/cross_tokenizer_distillation:${PYTHONPATH:-}
-# NRL_FORCE_REBUILD_VENVS only needed on first run — venvs are cached after
+export NRL_FORCE_REBUILD_VENVS=true  # Required: container transformers lacks qwen2 fast tokenizer
 
 MODEL_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
 
