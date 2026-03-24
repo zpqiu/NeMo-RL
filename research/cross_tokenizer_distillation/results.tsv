@@ -8,3 +8,4 @@ c1fd52c	14-16	keep	0	config + entry + SLURM script
 b2b0840	17	keep	10	10-step smoke test PASS: loss 51.5→0.06, Nemotron-9B student + Qwen3-4B teacher
 57b7a63	exp2	keep	50	50-step reverse KL: loss -1.75→-2.47, chunks 35K→189 (mode collapse)
 9525cf8	exp3	keep	50	50-step mixed KL(0.5): loss 38.9→0.12, chunks 30K→205 (stable)
+f8dd904	exp4	keep	50	50-step forward KL: loss 67→-0.96, chunks 34K→96 (severe collapse)
