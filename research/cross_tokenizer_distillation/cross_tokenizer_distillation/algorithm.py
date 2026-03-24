@@ -649,12 +649,22 @@ def cross_tokenizer_distillation_train(
                     if n_nonempty > 0:
                         sample_text = next(t for t in decoded_texts if t.strip())
                         print(f"  ⚙️  Sample text (first 100 chars): {sample_text[:100]!r}", flush=True)
-                    if n_chunks_total == 0 and n_nonempty > 0:
-                        # Debug: show why alignment fails
-                        for j, (txt, aln) in enumerate(zip(decoded_texts, alignments)):
-                            if txt.strip():
-                                print(f"  ⚙️  Sample {j}: text={txt[:50]!r}, teacher_toks={aln.num_teacher_tokens}, student_toks={aln.num_student_tokens}, chunks={aln.num_chunks}", flush=True)
-                                break
+                    else:
+                        # Debug: show raw token info
+                        print(f"  ⚙️  student_input_ids shape: {student_input_ids.shape}", flush=True)
+                        print(f"  ⚙️  input_lengths: {input_lengths.tolist()}", flush=True)
+                        print(f"  ⚙️  pad_token_id: {student_tokenizer.pad_token_id}", flush=True)
+                        # Show first sample's gen tokens
+                        i0 = 0
+                        pl = int(input_lengths[i0].item())
+                        gen_ids = student_input_ids[i0, pl:]
+                        n_pad = (gen_ids == student_tokenizer.pad_token_id).sum().item()
+                        n_total = gen_ids.numel()
+                        print(f"  ⚙️  Sample 0: gen_len={n_total}, n_pad={n_pad}, first 20 gen ids: {gen_ids[:20].tolist()}", flush=True)
+                        # Try decoding without skip_special_tokens
+                        non_pad = gen_ids[gen_ids != student_tokenizer.pad_token_id]
+                        text_raw = student_tokenizer.decode(non_pad[:50].tolist(), skip_special_tokens=False) if non_pad.numel() > 0 else "(all pad)"
+                        print(f"  ⚙️  Raw decode (first 50 non-pad): {text_raw[:100]!r}", flush=True)
 
                 # ---- 5) Get teacher logprobs ----
                 # Build teacher input: re-tokenize the student-generated text
