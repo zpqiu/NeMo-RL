@@ -778,7 +778,11 @@ def cross_tokenizer_distillation_train(
                 for k, v in metrics.items():
                     if isinstance(v, np.ndarray):
                         metrics[k] = np.sum(v).item()
-                metrics.update(train_results.get("all_mb_metrics", {}))
+                # Merge micro-batch metrics without overwriting loss
+                mb_metrics = train_results.get("all_mb_metrics", {})
+                for k, v in mb_metrics.items():
+                    if k not in metrics:
+                        metrics[k] = v
                 metrics.update(rollout_metrics)
 
                 total_valid_tokens += int(alignment_data["xalign_chunk_mask"].sum().item())
