@@ -29,7 +29,7 @@ MODEL_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alex
 cd $PROJECT_ROOT
 
 # Run cross-tokenizer distillation
-uv run research/cross_tokenizer_distillation/run_cross_distillation.py \
+uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     --config research/cross_tokenizer_distillation/configs/cross_distill_math.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
     cross_distillation.num_prompts_per_step=16 \
