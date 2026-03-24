@@ -205,11 +205,24 @@ def pack_alignment_into_data(
             all_student_indices.append([])
             continue
 
-        t_chunk_lps = compute_chunk_logprobs(t_gen_lps, alignment.chunks, "teacher")
+        # Filter chunks to only include those within logprobs range
+        max_teacher_idx = t_gen_lps.shape[0] - 1
+        valid_chunks = []
+        for chunk in alignment.chunks:
+            # Skip chunks with teacher indices beyond logprobs range
+            if all(idx <= max_teacher_idx for idx in chunk.teacher_token_indices):
+                valid_chunks.append(chunk)
+
+        if not valid_chunks:
+            all_teacher_chunk_lps.append(torch.zeros(0))
+            all_student_indices.append([])
+            continue
+
+        t_chunk_lps = compute_chunk_logprobs(t_gen_lps, valid_chunks, "teacher")
         all_teacher_chunk_lps.append(t_chunk_lps)
 
         sample_indices = []
-        for chunk in alignment.chunks:
+        for chunk in valid_chunks:
             sample_indices.append(chunk.student_token_indices)
         all_student_indices.append(sample_indices)
 
