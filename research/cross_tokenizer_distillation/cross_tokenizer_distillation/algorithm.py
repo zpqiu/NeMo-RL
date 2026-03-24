@@ -293,7 +293,15 @@ def setup(
     #     Teacher Tokenizer
     # ==========================
     print("\n▶ Loading teacher tokenizer (different from student!)...", flush=True)
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_config["model_name"])
+    teacher_model_name = teacher_config["model_name"]
+    if os.path.isdir(teacher_model_name):
+        teacher_tokenizer = AutoTokenizer.from_pretrained(
+            teacher_model_name, trust_remote_code=True, local_files_only=True
+        )
+    else:
+        teacher_tokenizer = AutoTokenizer.from_pretrained(
+            teacher_model_name, trust_remote_code=True
+        )
     print(
         f"  ✓ Teacher tokenizer: vocab_size={len(teacher_tokenizer)}, "
         f"model={teacher_config['model_name']}",

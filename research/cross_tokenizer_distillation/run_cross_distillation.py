@@ -68,8 +68,17 @@ def main() -> None:
 
     init_ray()
 
-    # Student tokenizer
-    student_tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    # Student tokenizer — handle local paths
+    tokenizer_name = config["policy"]["tokenizer"]["name"]
+    if os.path.isdir(tokenizer_name):
+        # Local path: load directly to avoid HF Hub validation issues
+        from transformers import AutoTokenizer as _AT
+        student_tokenizer = _AT.from_pretrained(tokenizer_name, trust_remote_code=True, local_files_only=True)
+        if student_tokenizer.pad_token is None:
+            student_tokenizer.pad_token = student_tokenizer.eos_token
+        print(f"Loaded student tokenizer from local path: {tokenizer_name}")
+    else:
+        student_tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
     if config["policy"]["generation"] is not None:
         config["policy"]["generation"] = configure_generation_config(
