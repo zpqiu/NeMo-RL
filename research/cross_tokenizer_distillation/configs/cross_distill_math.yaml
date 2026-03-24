@@ -39,6 +39,7 @@ policy: &STUDENT_BASE
     model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base"
     tokenizer:
         name: ${..model_name}
+        chat_template: null  # Use passthrough template for base model
         chat_template_kwargs: null
     train_global_batch_size: 32
     train_micro_batch_size: 1
@@ -132,9 +133,9 @@ policy: &STUDENT_BASE
 teacher:
     <<: *STUDENT_BASE
     model_name: "Qwen/Qwen3-4B-Base"
-    # Teacher uses its own tokenizer (Qwen) — loaded separately in setup()
     tokenizer:
         name: ${..model_name}
+        chat_template: null  # Use passthrough template for base model
         chat_template_kwargs: null
     dtensor_cfg:
         <<: *DTENSOR_BASE

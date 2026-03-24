@@ -302,6 +302,11 @@ def setup(
         teacher_tokenizer = AutoTokenizer.from_pretrained(
             teacher_model_name, trust_remote_code=True
         )
+    if teacher_tokenizer.pad_token is None:
+        teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+    # Ensure teacher tokenizer has a chat template (base models may not)
+    if not hasattr(teacher_tokenizer, "chat_template") or teacher_tokenizer.chat_template is None:
+        teacher_tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
     print(
         f"  ✓ Teacher tokenizer: vocab_size={len(teacher_tokenizer)}, "
         f"model={teacher_config['model_name']}",
