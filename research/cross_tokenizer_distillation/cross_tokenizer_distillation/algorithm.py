@@ -60,7 +60,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 from cross_tokenizer_distillation.cross_tokenizer_loss import (
     CrossTokenizerDistillationLossConfig,
-    CrossTokenizerDistillationLossFn,
+    CrossTokenizerTrainLossFn,
 )
 from cross_tokenizer_distillation.token_alignment import (
     AlignmentResult,
@@ -129,7 +129,7 @@ class CrossDistillMasterConfig(TypedDict):
 # ===============================================================================
 
 
-def decode_and_retokenize(
+def decode_and_align(
     generated_ids: torch.Tensor,
     input_lengths: torch.Tensor,
     student_tokenizer: PreTrainedTokenizerBase,
@@ -175,88 +175,81 @@ def decode_and_retokenize(
     return decoded_texts, alignments
 
 
-def build_teacher_input(
-    decoded_texts: list[str],
-    prompt_messages: list,
-    teacher_tokenizer: PreTrainedTokenizerBase,
-    max_seq_len: int,
-) -> BatchedDataDict:
-    """Build teacher input by re-tokenizing the student-generated text.
+def pack_alignment_into_data(
+    alignments: list[AlignmentResult],
+    teacher_gen_logprobs: list[torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Pack alignment info + teacher chunk logprobs into tensors for Policy.train().
 
-    The teacher sees the same prompt (re-tokenized) + the student's generated
-    response (re-tokenized with teacher's tokenizer).
+    Creates padded tensors that can be added to the training BatchedDataDict.
 
-    Returns a BatchedDataDict suitable for ``teacher_policy.get_logprobs()``.
+    Args:
+        alignments: List of AlignmentResult, one per sample.
+        teacher_gen_logprobs: List of teacher per-token logprobs for generated tokens.
+            Each tensor has shape (num_teacher_gen_tokens,).
+
+    Returns:
+        Dict of tensors to merge into train_data:
+        - teacher_chunk_logprobs: (B, max_C) padded
+        - chunk_student_indices: (B, max_C, max_T) padded student token indices
+        - chunk_mask: (B, max_C) valid chunk mask
+        - num_student_toks_per_chunk: (B, max_C)
     """
-    all_input_ids = []
-    all_input_lengths = []
-    all_token_masks = []
+    batch_size = len(alignments)
 
-    for text, prompt_msg in zip(decoded_texts, prompt_messages):
-        # Build the full conversation for teacher
-        # Apply chat template if available
-        if hasattr(teacher_tokenizer, "apply_chat_template"):
-            # Build messages list from prompt + generated response
-            messages = []
-            for msg in prompt_msg:
-                messages.append({"role": msg["role"], "content": msg["content"]})
-            messages.append({"role": "assistant", "content": text})
+    # Compute teacher chunk logprobs and collect student indices
+    all_teacher_chunk_lps: list[torch.Tensor] = []
+    all_student_indices: list[list[list[int]]] = []
 
-            full_ids = teacher_tokenizer.apply_chat_template(
-                messages, add_generation_prompt=False, return_tensors="pt"
-            ).squeeze(0)
+    for i, (alignment, t_gen_lps) in enumerate(zip(alignments, teacher_gen_logprobs)):
+        if alignment.num_chunks == 0:
+            all_teacher_chunk_lps.append(torch.zeros(0))
+            all_student_indices.append([])
+            continue
 
-            # Compute prompt length by encoding without the assistant response
-            prompt_only = messages[:-1]
-            prompt_ids = teacher_tokenizer.apply_chat_template(
-                prompt_only, add_generation_prompt=True, return_tensors="pt"
-            ).squeeze(0)
-            prompt_len = prompt_ids.shape[0]
-        else:
-            # Fallback: simple concatenation
-            prompt_text = teacher_tokenizer.decode(
-                teacher_tokenizer(
-                    "".join(m.get("content", "") for m in prompt_msg)
-                )["input_ids"]
-            )
-            gen_enc = teacher_tokenizer(text, add_special_tokens=False)
-            prompt_enc = teacher_tokenizer(prompt_text, add_special_tokens=True)
-            full_ids = torch.tensor(prompt_enc["input_ids"] + gen_enc["input_ids"])
-            prompt_len = len(prompt_enc["input_ids"])
+        t_chunk_lps = compute_chunk_logprobs(t_gen_lps, alignment.chunks, "teacher")
+        all_teacher_chunk_lps.append(t_chunk_lps)
 
-        # Truncate to max_seq_len
-        if full_ids.shape[0] > max_seq_len:
-            full_ids = full_ids[:max_seq_len]
+        sample_indices = []
+        for chunk in alignment.chunks:
+            sample_indices.append(chunk.student_token_indices)
+        all_student_indices.append(sample_indices)
 
-        # Token mask: 0 for prompt, 1 for generated
-        token_mask = torch.zeros(full_ids.shape[0], dtype=torch.long)
-        token_mask[prompt_len:] = 1
+    # Determine padding dimensions
+    max_chunks = max(lps.numel() for lps in all_teacher_chunk_lps) if all_teacher_chunk_lps else 0
+    max_toks = 1  # at least 1
+    for sample_idx in all_student_indices:
+        for chunk_idx in sample_idx:
+            max_toks = max(max_toks, len(chunk_idx))
 
-        all_input_ids.append(full_ids)
-        all_input_lengths.append(prompt_len)
-        all_token_masks.append(token_mask)
+    if max_chunks == 0:
+        max_chunks = 1  # avoid zero-size tensors
 
-    # Pad to same length
-    max_len = max(ids.shape[0] for ids in all_input_ids) if all_input_ids else 0
-    padded_ids = torch.full(
-        (len(all_input_ids), max_len),
-        teacher_tokenizer.pad_token_id or 0,
-        dtype=torch.long,
-    )
-    padded_masks = torch.zeros(len(all_input_ids), max_len, dtype=torch.long)
+    # Build padded tensors
+    teacher_chunk_logprobs = torch.zeros(batch_size, max_chunks)
+    chunk_student_indices = torch.zeros(batch_size, max_chunks, max_toks, dtype=torch.long)
+    chunk_mask = torch.zeros(batch_size, max_chunks)
+    num_student_toks = torch.zeros(batch_size, max_chunks, dtype=torch.long)
 
-    for i, (ids, mask) in enumerate(zip(all_input_ids, all_token_masks)):
-        padded_ids[i, : ids.shape[0]] = ids
-        padded_masks[i, : mask.shape[0]] = mask
+    for i in range(batch_size):
+        n_chunks = all_teacher_chunk_lps[i].numel()
+        if n_chunks == 0:
+            continue
+        teacher_chunk_logprobs[i, :n_chunks] = all_teacher_chunk_lps[i]
+        chunk_mask[i, :n_chunks] = 1.0
+        for c in range(n_chunks):
+            s_idx = all_student_indices[i][c]
+            n_t = len(s_idx)
+            num_student_toks[i, c] = n_t
+            if n_t > 0:
+                chunk_student_indices[i, c, :n_t] = torch.tensor(s_idx, dtype=torch.long)
 
-    return BatchedDataDict(
-        {
-            "input_ids": padded_ids,
-            "input_lengths": torch.tensor(all_input_lengths, dtype=torch.long),
-            "token_mask": padded_masks,
-            "sample_mask": torch.ones(len(all_input_ids), dtype=torch.float32),
-        }
-    )
+    return {
+        "teacher_chunk_logprobs": teacher_chunk_logprobs,
+        "chunk_student_indices": chunk_student_indices,
+        "chunk_mask": chunk_mask,
+        "num_student_toks_per_chunk": num_student_toks,
+    }
 
 
 # ===============================================================================
@@ -276,17 +269,13 @@ def setup(
     PreTrainedTokenizerBase,  # teacher_tokenizer
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    CrossTokenizerDistillationLossFn,
+    CrossTokenizerTrainLossFn,
     Logger,
     CheckpointManager,
     CrossDistillSaveState,
     CrossDistillMasterConfig,
 ]:
-    """Setup cross-tokenizer distillation.
-
-    Unlike standard distillation, this does NOT check vocab equality and loads
-    a separate teacher tokenizer.
-    """
+    """Setup cross-tokenizer distillation."""
     policy_config = master_config["policy"]
     teacher_config = master_config["teacher"]
     generation_config = master_config["policy"]["generation"]
@@ -352,7 +341,7 @@ def setup(
     print(f"  ✓ Training dataloader: {len(train_dataset)} samples", flush=True)
 
     val_dataloader: Optional[StatefulDataLoader] = None
-    if distill_config["val_period"] > 0 or distill_config["val_at_start"] or distill_config["val_at_end"]:
+    if distill_config["val_period"] > 0 or distill_config.get("val_at_start") or distill_config.get("val_at_end"):
         assert val_dataset is not None
         val_dataloader = StatefulDataLoader(
             val_dataset,
@@ -382,7 +371,6 @@ def setup(
         train_cluster = cluster
         inference_cluster = cluster
     else:
-        # Simplified: for non-colocated, reuse the same logic as distillation.py
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = cluster_config["num_nodes"]
         inference_resources = generation_config["colocated"]["resources"]
@@ -414,7 +402,6 @@ def setup(
     #      Teacher Policy
     # ==========================
     print("\n▶ Setting up teacher policy...", flush=True)
-    # NOTE: Teacher uses its OWN tokenizer
     teacher_policy = Policy(
         name_prefix="teacher",
         cluster=train_cluster,
@@ -433,6 +420,7 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]
 
+    student_generation: Optional[GenerationInterface] = None
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
@@ -456,7 +444,6 @@ def setup(
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
         optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
 
-    # NOTE: Student uses student_tokenizer
     student_policy = Policy(
         name_prefix="student",
         cluster=train_cluster,
@@ -480,7 +467,7 @@ def setup(
         futures_inference = student_generation.init_collective(ip, port, world_size, train_world_size=train_world_size)
         ray.get(futures_train + futures_inference)
 
-    loss_fn = CrossTokenizerDistillationLossFn(loss_config)
+    loss_fn = CrossTokenizerTrainLossFn(loss_config)
 
     print("\n" + "=" * 60)
     print(" " * 12 + "CROSS-TOKENIZER DISTILLATION SETUP COMPLETE")
@@ -514,7 +501,7 @@ def cross_tokenizer_distillation_train(
     teacher_tokenizer: PreTrainedTokenizerBase,
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
-    loss_fn: CrossTokenizerDistillationLossFn,
+    loss_fn: CrossTokenizerTrainLossFn,
     task_to_env: dict[str, EnvironmentInterface],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
@@ -522,7 +509,19 @@ def cross_tokenizer_distillation_train(
     save_state: CrossDistillSaveState,
     master_config: CrossDistillMasterConfig,
 ) -> None:
-    """Run cross-tokenizer distillation training."""
+    """Run cross-tokenizer distillation training.
+
+    The key difference from standard distillation:
+    1. Student generates text on-policy
+    2. Text is decoded back to string
+    3. String is re-tokenized with teacher tokenizer
+    4. Byte-offset alignment creates chunks
+    5. Teacher logprobs are computed on re-tokenized text
+    6. Teacher chunk logprobs + alignment info are packed into train_data
+    7. Policy.train() does the student forward + backward + optimizer step
+       using CrossTokenizerTrainLossFn which aggregates student logprobs
+       into chunks and computes chunk-level KL
+    """
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
@@ -598,7 +597,7 @@ def cross_tokenizer_distillation_train(
                         )
                     student_generation.finish_generation()
 
-                # ---- 3) Flatten student output and decode text ----
+                # ---- 3) Flatten student output ----
                 with timer.time("data_processing"):
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
@@ -618,30 +617,87 @@ def cross_tokenizer_distillation_train(
                 # ---- 4) Text-space alignment ----
                 print("▶ Decoding text & computing cross-tokenizer alignment...", flush=True)
                 with timer.time("alignment"):
-                    decoded_texts, alignments = decode_and_retokenize(
+                    decoded_texts, alignments = decode_and_align(
                         generated_ids=student_input_ids,
                         input_lengths=input_lengths,
                         student_tokenizer=student_tokenizer,
                         teacher_tokenizer=teacher_tokenizer,
                     )
 
-                    # Build teacher input
-                    # Extract prompt messages from the batch
-                    prompt_messages = []
-                    for msg_log in repeated_batch["message_log"]:
-                        prompt_msgs = [m for m in msg_log if m["role"] != "assistant"]
-                        prompt_messages.append(prompt_msgs)
+                # ---- 5) Get teacher logprobs ----
+                # Build teacher input: re-tokenize the student-generated text
+                # with the teacher tokenizer, keeping the same prompts.
+                print("▶ Computing teacher logprobs...", flush=True)
 
-                    teacher_train_data = build_teacher_input(
-                        decoded_texts=decoded_texts,
-                        prompt_messages=prompt_messages,
-                        teacher_tokenizer=teacher_tokenizer,
-                        max_seq_len=max_seq_len,
-                    )
+                with timer.time("teacher_data_prep"):
+                    # Build teacher input by re-tokenizing decoded text
+                    teacher_all_ids = []
+                    teacher_input_lengths = []
+                    teacher_token_masks = []
+
+                    for idx, (text, alignment) in enumerate(zip(decoded_texts, alignments)):
+                        if not text or alignment.num_chunks == 0:
+                            # Minimal dummy input for empty generations
+                            t_ids = torch.tensor([teacher_tokenizer.bos_token_id or 0], dtype=torch.long)
+                            teacher_all_ids.append(t_ids)
+                            teacher_input_lengths.append(1)
+                            teacher_token_masks.append(torch.zeros(1, dtype=torch.long))
+                            continue
+
+                        # Get prompt messages
+                        prompt_msgs = [m for m in repeated_batch["message_log"][idx] if m["role"] != "assistant"]
+
+                        # Build teacher input with chat template
+                        if hasattr(teacher_tokenizer, "apply_chat_template"):
+                            messages = []
+                            for msg in prompt_msgs:
+                                messages.append({"role": msg["role"], "content": msg["content"]})
+                            messages.append({"role": "assistant", "content": text})
+
+                            full_ids = teacher_tokenizer.apply_chat_template(
+                                messages, add_generation_prompt=False, return_tensors="pt"
+                            ).squeeze(0)
+
+                            prompt_only = messages[:-1]
+                            prompt_ids = teacher_tokenizer.apply_chat_template(
+                                prompt_only, add_generation_prompt=True, return_tensors="pt"
+                            ).squeeze(0)
+                            prompt_len = prompt_ids.shape[0]
+                        else:
+                            prompt_text = "".join(m.get("content", "") for m in prompt_msgs)
+                            prompt_enc = teacher_tokenizer(prompt_text, add_special_tokens=True)
+                            gen_enc = teacher_tokenizer(text, add_special_tokens=False)
+                            full_ids = torch.tensor(prompt_enc["input_ids"] + gen_enc["input_ids"])
+                            prompt_len = len(prompt_enc["input_ids"])
+
+                        if full_ids.shape[0] > max_seq_len:
+                            full_ids = full_ids[:max_seq_len]
+
+                        t_mask = torch.zeros(full_ids.shape[0], dtype=torch.long)
+                        t_mask[prompt_len:] = 1
+
+                        teacher_all_ids.append(full_ids)
+                        teacher_input_lengths.append(prompt_len)
+                        teacher_token_masks.append(t_mask)
+
+                    # Pad teacher inputs
+                    t_max_len = max(ids.shape[0] for ids in teacher_all_ids) if teacher_all_ids else 1
+                    t_pad_id = teacher_tokenizer.pad_token_id or 0
+                    t_padded_ids = torch.full((len(teacher_all_ids), t_max_len), t_pad_id, dtype=torch.long)
+                    t_padded_masks = torch.zeros(len(teacher_all_ids), t_max_len, dtype=torch.long)
+
+                    for i, (ids, mask) in enumerate(zip(teacher_all_ids, teacher_token_masks)):
+                        t_padded_ids[i, :ids.shape[0]] = ids
+                        t_padded_masks[i, :mask.shape[0]] = mask
+
+                    teacher_train_data = BatchedDataDict({
+                        "input_ids": t_padded_ids,
+                        "input_lengths": torch.tensor(teacher_input_lengths, dtype=torch.long),
+                        "token_mask": t_padded_masks,
+                        "sample_mask": torch.ones(len(teacher_all_ids), dtype=torch.float32),
+                    })
                     teacher_train_data.to("cpu")
 
-                # ---- 5) Teacher forward → logprobs ----
-                print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
 
@@ -649,82 +705,61 @@ def cross_tokenizer_distillation_train(
                     teacher_logprob_result = teacher_policy.get_logprobs(teacher_train_data, timer=timer)
                     teacher_token_logprobs = teacher_logprob_result["logprobs"]  # (B, S-1)
 
-                # ---- 6) Student forward → logprobs ----
-                print("▶ Computing student logprobs...", flush=True)
+                # ---- 6) Pack alignment + teacher chunk logprobs into train_data ----
+                print("▶ Packing alignment data...", flush=True)
+                with timer.time("alignment_packing"):
+                    # Extract teacher generation logprobs
+                    teacher_gen_logprobs = []
+                    for i in range(teacher_token_logprobs.shape[0]):
+                        t_prompt_len = teacher_input_lengths[i]
+                        # logprobs[t] = logprob of token[t+1] given [0..t]
+                        # For generation starting at position t_prompt_len,
+                        # the first gen token's logprob is at index t_prompt_len - 1
+                        t_gen_lps = teacher_token_logprobs[i, t_prompt_len - 1:]
+                        teacher_gen_logprobs.append(t_gen_lps)
+
+                    alignment_data = pack_alignment_into_data(alignments, teacher_gen_logprobs)
+
+                # ---- 7) Build student train_data and call Policy.train() ----
+                print("▶ Training student policy...", flush=True)
                 with timer.time("training_prep"):
                     teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                # Build student train data
-                student_train_data = BatchedDataDict(
-                    {
-                        "input_ids": student_input_ids,
-                        "input_lengths": input_lengths,
-                        "token_mask": flat_messages["token_loss_mask"],
-                        "sample_mask": repeated_batch["loss_multiplier"],
-                    }
-                )
-                student_train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
-                student_train_data.to("cpu")
+                train_data = BatchedDataDict({
+                    "input_ids": student_input_ids,
+                    "input_lengths": input_lengths,
+                    "token_mask": flat_messages["token_loss_mask"],
+                    "sample_mask": repeated_batch["loss_multiplier"],
+                    # Cross-tokenizer alignment data
+                    "teacher_chunk_logprobs": alignment_data["teacher_chunk_logprobs"],
+                    "chunk_student_indices": alignment_data["chunk_student_indices"],
+                    "chunk_mask": alignment_data["chunk_mask"],
+                    "num_student_toks_per_chunk": alignment_data["num_student_toks_per_chunk"],
+                })
+                train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                train_data.to("cpu")
 
-                # Get student logprobs via get_logprobs
-                with timer.time("student_logprob_inference"):
-                    student_logprob_result = student_policy.get_logprobs(student_train_data, timer=timer)
-                    student_token_logprobs = student_logprob_result["logprobs"]  # (B, S-1)
-
-                # ---- 7) Chunk-level KL loss ----
-                print("▶ Computing chunk-level KL loss...", flush=True)
-                with timer.time("loss_computation"):
-                    teacher_chunk_lps_batch = []
-                    student_chunk_lps_batch = []
-
-                    for i, alignment in enumerate(alignments):
-                        if alignment.num_chunks == 0:
-                            teacher_chunk_lps_batch.append(torch.zeros(0))
-                            student_chunk_lps_batch.append(torch.zeros(0))
-                            continue
-
-                        # Teacher: extract logprobs for generated tokens
-                        t_input_len = int(teacher_train_data["input_lengths"][i].item())
-                        t_gen_logprobs = teacher_token_logprobs[i, t_input_len - 1:]
-
-                        # Student: extract logprobs for generated tokens
-                        s_input_len = int(input_lengths[i].item())
-                        s_gen_logprobs = student_token_logprobs[i, s_input_len - 1:]
-
-                        t_chunk_lps = compute_chunk_logprobs(t_gen_logprobs, alignment.chunks, "teacher")
-                        s_chunk_lps = compute_chunk_logprobs(s_gen_logprobs, alignment.chunks, "student")
-
-                        teacher_chunk_lps_batch.append(t_chunk_lps)
-                        student_chunk_lps_batch.append(s_chunk_lps)
-
-                    loss, loss_metrics = loss_fn(teacher_chunk_lps_batch, student_chunk_lps_batch)
-
-                # ---- 8) Student backward + update ----
-                print("▶ Training student policy...", flush=True)
                 with timer.time("policy_training"):
-                    # For now, we use the loss computed externally and pass it
-                    # through the standard train interface.
-                    # We inject the pre-computed loss into the training data
-                    # and use NLLLossFn as a passthrough.
-                    #
-                    # TODO: Integrate more tightly with Policy.train() to avoid
-                    # double forward pass. For the initial prototype, we compute
-                    # logprobs separately and compute loss externally, then do a
-                    # separate backward pass.
-                    loss.backward()
+                    train_results = student_policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
-                    # Log the loss
-                    train_loss = loss.item()
-
-                # Metrics
+                # ---- 8) Metrics ----
                 metrics = {
-                    "loss": train_loss,
-                    **loss_metrics,
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
                 }
+                for k, v in metrics.items():
+                    if isinstance(v, np.ndarray):
+                        metrics[k] = np.sum(v).item()
+                metrics.update(train_results.get("all_mb_metrics", {}))
                 metrics.update(rollout_metrics)
-                total_valid_tokens += loss_metrics.get("num_chunks", 0)
+
+                total_valid_tokens += int(alignment_data["chunk_mask"].sum().item())
 
                 # Checkpointing
                 consumed_samples += distill_config["num_prompts_per_step"]
@@ -770,14 +805,12 @@ def cross_tokenizer_distillation_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
             total_time = timing_metrics.get("total_step_time", 0)
 
+            train_loss = metrics.get("loss", float("nan"))
             print(f"\n📊 Step {total_steps + 1} Results:")
             print(f"  • Loss (chunk KL): {train_loss:.4f}")
-            print(f"  • Chunks: {loss_metrics.get('num_chunks', 0)}")
+            print(f"  • Chunks: {int(alignment_data['chunk_mask'].sum().item())}")
             print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
             print(f"\n⏱️  Timing: {total_time:.2f}s total", flush=True)
-            for k, v in sorted(timing_metrics.items(), key=lambda x: x[1], reverse=True):
-                if k != "total_step_time" and total_time > 0:
-                    print(f"  • {k}: {v:.2f}s ({v / total_time * 100:.1f}%)", flush=True)
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
