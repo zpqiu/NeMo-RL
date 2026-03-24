@@ -23,6 +23,7 @@ JSON_METRICS=$EXP_DIR/metrics.json
 mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 
 export PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/research/cross_tokenizer_distillation:${PYTHONPATH:-}
+export NRL_FORCE_REBUILD_VENVS=true
 
 MODEL_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
 
