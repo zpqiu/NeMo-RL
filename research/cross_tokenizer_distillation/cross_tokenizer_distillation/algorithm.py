@@ -634,11 +634,24 @@ def cross_tokenizer_distillation_train(
                     student_input_ids = flat_messages["token_ids"]  # (B, S)
 
                 # ---- 4) Text-space alignment ----
+                # Extract prompt lengths from message log (not input_lengths which is total)
                 print("▶ Decoding text & computing cross-tokenizer alignment...", flush=True)
                 with timer.time("alignment"):
+                    # Compute prompt-only lengths
+                    prompt_lengths = []
+                    for msg_log in repeated_batch["message_log"]:
+                        plen = 0
+                        for msg in msg_log:
+                            if msg["role"] != "assistant":
+                                plen += msg["token_ids"].shape[0]
+                            else:
+                                break  # Stop at first assistant message
+                        prompt_lengths.append(plen)
+                    prompt_lengths_tensor = torch.tensor(prompt_lengths, dtype=torch.long)
+
                     decoded_texts, alignments = decode_and_align(
                         generated_ids=student_input_ids,
-                        input_lengths=input_lengths,
+                        input_lengths=prompt_lengths_tensor,
                         student_tokenizer=student_tokenizer,
                         teacher_tokenizer=teacher_tokenizer,
                     )
