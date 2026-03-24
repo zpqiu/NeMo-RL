@@ -1,5 +1,5 @@
 # Cross-Tokenizer On-Policy Distillation Configuration
-# Teacher: Qwen3-4B-Instruct-2507 (Qwen3 tokenizer, vocab=151936)
+# Teacher: Qwen3-4B-Base (Qwen3 tokenizer, vocab=151936)
 # Student: nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base (Nemotron tokenizer, vocab=131072)
 #
 # Key difference from standard distillation:
@@ -131,7 +131,7 @@ policy: &STUDENT_BASE
 # Teacher: DIFFERENT tokenizer family (Qwen3, vocab=151936)
 teacher:
     <<: *STUDENT_BASE
-    model_name: "Qwen/Qwen3-4B-Instruct-2507"
+    model_name: "Qwen/Qwen3-4B-Base"
     # Teacher uses its own tokenizer (Qwen) — loaded separately in setup()
     tokenizer:
         name: ${..model_name}

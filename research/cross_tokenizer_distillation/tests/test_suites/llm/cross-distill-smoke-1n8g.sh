@@ -34,10 +34,8 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     cross_distillation.max_num_steps=$MAX_STEPS \
     cross_distillation.num_prompts_per_step=16 \
     cross_distillation.val_period=0 \
-    policy.model_name=$MODEL_DIR/nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
-    policy.tokenizer.name=$MODEL_DIR/nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
-    teacher.model_name=$MODEL_DIR/Qwen/Qwen3-4B-Instruct-2507 \
-    teacher.tokenizer.name=$MODEL_DIR/Qwen/Qwen3-4B-Instruct-2507 \
+    policy.model_name=nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
+    teacher.model_name=Qwen/Qwen3-4B-Base \
     policy.max_total_sequence_length=2048 \
     policy.train_global_batch_size=16 \
     policy.generation_batch_size=16 \
