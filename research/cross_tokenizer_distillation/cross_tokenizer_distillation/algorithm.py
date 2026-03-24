@@ -642,6 +642,19 @@ def cross_tokenizer_distillation_train(
                         student_tokenizer=student_tokenizer,
                         teacher_tokenizer=teacher_tokenizer,
                     )
+                    # Debug: print alignment stats
+                    n_nonempty = sum(1 for t in decoded_texts if t.strip())
+                    n_chunks_total = sum(a.num_chunks for a in alignments)
+                    print(f"  ⚙️  Decoded {len(decoded_texts)} texts, {n_nonempty} non-empty, {n_chunks_total} total chunks", flush=True)
+                    if n_nonempty > 0:
+                        sample_text = next(t for t in decoded_texts if t.strip())
+                        print(f"  ⚙️  Sample text (first 100 chars): {sample_text[:100]!r}", flush=True)
+                    if n_chunks_total == 0 and n_nonempty > 0:
+                        # Debug: show why alignment fails
+                        for j, (txt, aln) in enumerate(zip(decoded_texts, alignments)):
+                            if txt.strip():
+                                print(f"  ⚙️  Sample {j}: text={txt[:50]!r}, teacher_toks={aln.num_teacher_tokens}, student_toks={aln.num_student_tokens}, chunks={aln.num_chunks}", flush=True)
+                                break
 
                 # ---- 5) Get teacher logprobs ----
                 # Build teacher input: re-tokenize the student-generated text
