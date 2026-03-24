@@ -150,7 +150,7 @@ class TestLossWithAlignment:
     def test_with_chunk_masks(self):
         """Test masking specific chunks."""
         t_lps = torch.tensor([-1.0, -2.0, -3.0])
-        s_lps = torch.tensor([-1.5, -2.5, -3.5])
+        s_lps = torch.tensor([-1.5, -1.5, -3.5])  # non-uniform differences
         mask = torch.tensor([1.0, 0.0, 1.0])  # mask out chunk 1
 
         loss_fn = _make_loss_fn("forward")

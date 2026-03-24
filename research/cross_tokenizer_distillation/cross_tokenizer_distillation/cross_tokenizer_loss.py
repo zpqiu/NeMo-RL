@@ -77,16 +77,26 @@ def _compute_chunk_kl(
     kl_type: str,
     mixed_kl_weight: float = 0.5,
 ) -> torch.Tensor:
-    teacher_p = teacher_chunk_logprobs.exp()
-    student_p = student_chunk_logprobs.exp()
-
+    """Per-chunk KL divergence using mean token logprob difference.
+    
+    Since chunk logprobs are sums of per-token logprobs (joint log-probs),
+    we compute KL as the difference of mean per-token logprobs, which is
+    equivalent to cross-entropy difference and always well-defined.
+    
+    For forward KL: teacher_lp - student_lp (positive when student is worse)
+    For reverse KL: student_lp - teacher_lp (positive when teacher is worse)
+    """
     if kl_type == "forward":
-        kl = teacher_p * (teacher_chunk_logprobs - student_chunk_logprobs)
+        # Forward: minimize cross-entropy from teacher's perspective
+        # CE(teacher, student) - H(teacher) ≈ teacher_lp - student_lp
+        kl = teacher_chunk_logprobs - student_chunk_logprobs
     elif kl_type == "reverse":
-        kl = student_p * (student_chunk_logprobs - teacher_chunk_logprobs)
+        # Reverse: minimize from student's perspective
+        kl = student_chunk_logprobs - teacher_chunk_logprobs
     else:
-        fwd = teacher_p * (teacher_chunk_logprobs - student_chunk_logprobs)
-        rev = student_p * (student_chunk_logprobs - teacher_chunk_logprobs)
+        # Mixed
+        fwd = teacher_chunk_logprobs - student_chunk_logprobs
+        rev = student_chunk_logprobs - teacher_chunk_logprobs
         kl = mixed_kl_weight * fwd + (1.0 - mixed_kl_weight) * rev
     return kl
 
