@@ -8,8 +8,8 @@ checkpointing:
   save_period: 10
 
 grpo:
-  num_prompts_per_step: 8
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
 
 policy:
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
@@ -17,7 +17,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs:
       enable_thinking: false
-  train_global_batch_size: 64
+  train_global_batch_size: 512
   generation_batch_size: 8
   # SWE pivot prompts can expand dramatically once tool schemas and chat formatting
   # are included in the actual request sent to vLLM.
@@ -101,9 +101,9 @@ policy:
   scheduler: null
 
   generation:
-    max_new_tokens: 2048
+    max_new_tokens: ${policy.max_total_sequence_length}
     vllm_cfg:
-      tensor_parallel_size: 1
+      tensor_parallel_size: 2
       max_model_len: ${policy.max_total_sequence_length}
       gpu_memory_utilization: 0.65
       enable_thinking: false
