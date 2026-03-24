@@ -5,3 +5,4 @@ cfe403e	3-6	keep	11	token alignment module + tests (all pass)
 ab75e02	7-8	keep	12	cross-tokenizer loss + tests (all pass)
 e0a68b1	9-13	keep	29	algorithm + tests (all 29 pass)
 c1fd52c	14-16	keep	0	config + entry + SLURM script
+b2b0840	17	keep	10	10-step smoke test PASS: loss 51.5→0.06, Nemotron-9B student + Qwen3-4B teacher
