@@ -3,3 +3,5 @@ ebe4083	1	keep	1	project skeleton
 bfb2ef4	2	keep	1	pyproject.toml + workspace member
 cfe403e	3-6	keep	11	token alignment module + tests (all pass)
 ab75e02	7-8	keep	12	cross-tokenizer loss + tests (all pass)
+e0a68b1	9-13	keep	29	algorithm + tests (all 29 pass)
+c1fd52c	14-16	keep	0	config + entry + SLURM script
