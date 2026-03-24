@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../../..)
+PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../../../..)
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
