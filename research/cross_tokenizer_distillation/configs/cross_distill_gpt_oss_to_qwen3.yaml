@@ -20,7 +20,7 @@ cross_distillation:
 loss_fn:
   kl_type: "forward"
   mixed_kl_weight: 0.5
-  nll_anchor_weight: 0.5
+  nll_anchor_weight: 0.1
 
 checkpointing:
   enabled: true

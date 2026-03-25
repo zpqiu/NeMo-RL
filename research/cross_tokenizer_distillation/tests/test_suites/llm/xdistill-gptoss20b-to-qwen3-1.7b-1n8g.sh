@@ -5,8 +5,8 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../../../..)
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=8
-STEPS_PER_RUN=30
-MAX_STEPS=30
+STEPS_PER_RUN=50
+MAX_STEPS=50
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -35,6 +35,7 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     cross_distillation.max_num_steps=$MAX_STEPS \
     cross_distillation.val_at_start=true \
     policy.model_name=$MODEL_DIR/Qwen/Qwen3-1.7B-Base \
+    policy.optimizer.kwargs.lr=5e-6 \
     teacher.model_name=$MODEL_DIR/openai/gpt-oss-20b \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
