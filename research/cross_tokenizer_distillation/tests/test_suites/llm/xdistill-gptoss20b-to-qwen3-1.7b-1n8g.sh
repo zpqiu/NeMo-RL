@@ -47,7 +47,7 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
 echo ""
 echo "============================================"
 echo "  Cross-Tokenizer Distillation: gpt-oss-20b -> Qwen3-1.7B"
-echo "  Experiment: Length-Normalized Chunk KL"
+echo "  Experiment: Forward KL + NLL Anchor + Length Normalization"
 echo "============================================"
 
 echo ""

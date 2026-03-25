@@ -1029,8 +1029,12 @@ def cross_tokenizer_distillation_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             train_loss = metrics.get("loss", float("nan"))
+            distill_loss = metrics.get("distill_loss", float("nan"))
+            nll_loss = metrics.get("nll_loss", float("nan"))
             print(f"\n📊 Step {total_steps + 1} Results:")
-            print(f"  • Loss (chunk KL): {train_loss:.4f}")
+            print(f"  • Loss (total): {train_loss:.4f}")
+            print(f"  • Distill loss: {distill_loss:.4f}")
+            print(f"  • NLL loss: {nll_loss:.4f}")
             print(f"  • Chunks: {int(alignment_data['xalign_chunk_mask'].sum().item())}")
             print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
             print(f"\n⏱️  Timing: {total_time:.2f}s total", flush=True)

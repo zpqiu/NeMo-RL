@@ -65,6 +65,7 @@ except ImportError:
 class CrossTokenizerDistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
+    nll_anchor_weight: float  # Weight for NLL anchor loss (0 = disabled, >0 = blended)
 
 
 # ===================================================================
@@ -176,6 +177,7 @@ class CrossTokenizerTrainLossFn:
     def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
+        self.nll_anchor_weight = cfg.get("nll_anchor_weight", 0.0)
         assert self.kl_type in ("forward", "reverse", "mixed")
         assert 0 <= self.mixed_kl_weight <= 1
 
@@ -198,6 +200,7 @@ class CrossTokenizerTrainLossFn:
         num_s_toks = data["xalign_num_student_toks"].to(device)
         num_t_toks = data["xalign_num_teacher_toks"].to(device)
         input_lengths = data["input_lengths"].to(device)
+        token_mask = data["token_mask"].to(device)
 
         # Find max valid chunks to avoid iterating over all S positions
         max_valid = int(chunk_mask.sum(dim=1).max().item()) if chunk_mask.sum() > 0 else 0
@@ -257,10 +260,27 @@ class CrossTokenizerTrainLossFn:
             self.kl_type, self.mixed_kl_weight,
         )
 
-        loss = chunk_kl.mean()
+        distill_loss = chunk_kl.mean()
+
+        # NLL anchor loss: standard next-token prediction loss on generated tokens
+        # This prevents the student from drifting away from being a good language model
+        nll_loss = torch.tensor(0.0, device=device)
+        if self.nll_anchor_weight > 0:
+            # next_token_logprobs are already log p(x_t | x_{<t})
+            # NLL = -mean(log p(x_t | x_{<t})) over valid generation tokens
+            # token_mask marks which positions are generation (assistant) tokens
+            gen_logprobs = next_token_logprobs * token_mask[:, :next_token_logprobs.shape[1]]
+            n_gen_tokens = token_mask[:, :next_token_logprobs.shape[1]].sum().clamp(min=1)
+            nll_loss = -gen_logprobs.sum() / n_gen_tokens
+
+        # Blend: total_loss = (1 - α) * distill_loss + α * nll_loss
+        alpha = self.nll_anchor_weight
+        loss = (1.0 - alpha) * distill_loss + alpha * nll_loss
 
         metrics = {
             "loss": loss.item(),
+            "distill_loss": distill_loss.item(),
+            "nll_loss": nll_loss.item(),
             "num_chunks": len(all_student_chunk_lps),
             "num_valid_samples": batch_size,
             "mean_student_toks_per_chunk": s_tok_counts.mean().item(),

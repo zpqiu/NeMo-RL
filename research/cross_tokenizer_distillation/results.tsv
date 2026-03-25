@@ -13,3 +13,4 @@ f8dd904	exp4	keep	50	50-step forward KL: loss 67→-0.96, chunks 34K→96 (sever
 3d7054c	exp6c	keep	50	50-step forward KL lr=1e-6: loss 56.7→0.13 chunks 36K→22K (NO collapse!) ⭐
 2d04910	exp7	drop	50	50-step mixed KL(0.5) lr=1e-6: ALL ZEROS (bug: forward+reverse=0)
 2d04910	exp8	keep	50	50-step mixed abs KL lr=1e-6: loss 54.7→2.4 chunks 35K→25K (stable)
+b79cd54	exp2-lenorm	keep	30	Length-normalized chunk KL: NO gibberish (vs immediate collapse before). Acc: 0.63%→0.83%(step5)→0.42%(step30). Loss drops 257→4.5 too fast, accuracy degrades after step 10. Need slower LR or anchor loss.
