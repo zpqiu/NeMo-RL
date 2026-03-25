@@ -15,3 +15,4 @@ f8dd904	exp4	keep	50	50-step forward KL: loss 67→-0.96, chunks 34K→96 (sever
 2d04910	exp8	keep	50	50-step mixed abs KL lr=1e-6: loss 54.7→2.4 chunks 35K→25K (stable)
 b79cd54	exp2-lenorm	keep	30	Length-normalized chunk KL: NO gibberish (vs immediate collapse before). Acc: 0.63%→0.83%(step5)→0.42%(step30). Loss drops 257→4.5 too fast, accuracy degrades after step 10. Need slower LR or anchor loss.
 ec30376	exp3-fwd-nll	keep	30	Forward KL + NLL anchor(α=0.5) + length-norm. Coherent outputs 27/30 steps. Acc: 0.63%→0.83%(step10-20)→0.0%(step25)→0.42%(step30). Distill loss: 10.9→0.45. NLL stable ~1.0. Accuracy plateaus at baseline, doesn't improve. Step 25 accuracy=0 is concerning.
+144cfe1	exp4-hiLR	drop	50	LR=5e-6, NLL anchor=0.1, 50 steps. MODE COLLAPSE starting ~step 13. Chunks 107K→29K→500. Gen length 900→2. Accuracy→0. LR too aggressive. Revert to 1e-6.
