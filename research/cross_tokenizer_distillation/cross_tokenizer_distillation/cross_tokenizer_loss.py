@@ -167,6 +167,7 @@ class CrossTokenizerTrainLossFn:
     - ``xalign_chunk_student_start``: (B, S) start index of student tokens per chunk
     - ``xalign_chunk_mask``: (B, S) valid chunk mask
     - ``xalign_num_student_toks``: (B, S) count of consecutive student tokens per chunk
+    - ``xalign_num_teacher_toks``: (B, S) count of teacher tokens per chunk
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -195,6 +196,7 @@ class CrossTokenizerTrainLossFn:
         chunk_student_start = data["xalign_chunk_student_start"].to(device)
         chunk_mask = data["xalign_chunk_mask"].to(device)
         num_s_toks = data["xalign_num_student_toks"].to(device)
+        num_t_toks = data["xalign_num_teacher_toks"].to(device)
         input_lengths = data["input_lengths"].to(device)
 
         # Find max valid chunks to avoid iterating over all S positions
@@ -204,20 +206,22 @@ class CrossTokenizerTrainLossFn:
         # Build student_chunk_lps as a list → stack to maintain autograd graph
         all_student_chunk_lps = []
         all_teacher_chunk_lps = []
-        all_chunk_valid = []
+        all_student_tok_counts = []
+        all_teacher_tok_counts = []
 
         for b in range(batch_size):
             prompt_len = int(input_lengths[b].item())
             for c in range(max_valid):
                 if chunk_mask[b, c] == 0:
                     continue
-                n_toks = int(num_s_toks[b, c].item())
-                if n_toks == 0:
+                n_s_toks = int(num_s_toks[b, c].item())
+                n_t_toks = int(num_t_toks[b, c].item())
+                if n_s_toks == 0 or n_t_toks == 0:
                     continue
                 start_idx = int(chunk_student_start[b, c].item())
                 # Map generation token indices to logprob indices
                 lp_start = prompt_len - 1 + start_idx
-                lp_end = lp_start + n_toks
+                lp_end = lp_start + n_s_toks
                 max_lp_idx = next_token_logprobs.shape[1]
                 lp_start = max(0, min(lp_start, max_lp_idx - 1))
                 lp_end = max(lp_start + 1, min(lp_end, max_lp_idx))
@@ -227,6 +231,8 @@ class CrossTokenizerTrainLossFn:
 
                 all_student_chunk_lps.append(s_chunk_lp)
                 all_teacher_chunk_lps.append(t_chunk_lp)
+                all_student_tok_counts.append(n_s_toks)
+                all_teacher_tok_counts.append(n_t_toks)
 
         if len(all_student_chunk_lps) == 0:
             # No valid chunks — return zero loss
@@ -236,10 +242,18 @@ class CrossTokenizerTrainLossFn:
         # Stack all chunks into flat tensors (grad flows through student side)
         student_flat = torch.stack(all_student_chunk_lps)  # (N_chunks,)
         teacher_flat = torch.stack(all_teacher_chunk_lps)  # (N_chunks,)
+        s_tok_counts = torch.tensor(all_student_tok_counts, dtype=torch.float32, device=device)
+        t_tok_counts = torch.tensor(all_teacher_tok_counts, dtype=torch.float32, device=device)
 
-        # Compute KL
+        # Length-normalize: convert sum(logprobs) to mean(logprobs) per chunk
+        # This makes teacher and student logprobs comparable regardless of
+        # how many tokens each tokenizer uses for the same text span.
+        student_normalized = student_flat / s_tok_counts
+        teacher_normalized = teacher_flat / t_tok_counts
+
+        # Compute KL on normalized per-token logprobs
         chunk_kl = _compute_chunk_kl(
-            teacher_flat, student_flat,
+            teacher_normalized, student_normalized,
             self.kl_type, self.mixed_kl_weight,
         )
 
@@ -249,6 +263,8 @@ class CrossTokenizerTrainLossFn:
             "loss": loss.item(),
             "num_chunks": len(all_student_chunk_lps),
             "num_valid_samples": batch_size,
+            "mean_student_toks_per_chunk": s_tok_counts.mean().item(),
+            "mean_teacher_toks_per_chunk": t_tok_counts.mean().item(),
         }
 
         return loss, metrics

@@ -5,8 +5,8 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../../../..)
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=8
-MAX_STEPS=100
-NUM_MINUTES=720
+MAX_STEPS=30
+NUM_MINUTES=360
 # ===== END CONFIG =====
 
 set -eou pipefail
@@ -17,6 +17,8 @@ LOG_DIR=$EXP_DIR/logs
 CKPT_DIR=$EXP_DIR/ckpts
 RUN_LOG=$EXP_DIR/run.log
 
+# Clean previous checkpoints to start fresh
+rm -rf $CKPT_DIR
 mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 
 export PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/research/cross_tokenizer_distillation:${PYTHONPATH:-}
@@ -29,6 +31,7 @@ cd $PROJECT_ROOT
 uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     --config research/cross_tokenizer_distillation/configs/cross_distill_gpt_oss_to_qwen3.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
+    cross_distillation.val_at_start=true \
     policy.model_name=$MODEL_DIR/Qwen/Qwen3-1.7B-Base \
     teacher.model_name=$MODEL_DIR/openai/gpt-oss-20b \
     logger.log_dir=$LOG_DIR \
@@ -42,12 +45,17 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
 echo ""
 echo "============================================"
 echo "  Cross-Tokenizer Distillation: gpt-oss-20b -> Qwen3-1.7B"
+echo "  Experiment: Length-Normalized Chunk KL"
 echo "============================================"
 
-if grep -q "val/acc" $RUN_LOG; then
-    echo "val/acc results:"
-    grep "val/acc" $RUN_LOG
-else
-    echo "No val/acc found in log"
-    tail -50 $RUN_LOG
-fi
+echo ""
+echo "=== Validation Accuracy ==="
+grep -E "(Accuracy|accuracy)" $RUN_LOG || echo "No accuracy found"
+
+echo ""
+echo "=== Training Loss ==="
+grep "Loss (chunk KL)" $RUN_LOG || echo "No loss found"
+
+echo ""
+echo "=== Sample Outputs ==="
+grep "Sample text" $RUN_LOG || echo "No sample text found"
