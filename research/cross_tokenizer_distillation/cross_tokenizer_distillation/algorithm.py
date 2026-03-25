@@ -1029,8 +1029,17 @@ def cross_tokenizer_distillation_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             train_loss = metrics.get("loss", float("nan"))
-            distill_loss = metrics.get("distill_loss", float("nan"))
-            nll_loss = metrics.get("nll_loss", float("nan"))
+            distill_loss_raw = metrics.get("distill_loss", float("nan"))
+            nll_loss_raw = metrics.get("nll_loss", float("nan"))
+            # Metrics from micro-batches may come as lists — take mean
+            if isinstance(distill_loss_raw, list):
+                distill_loss = sum(distill_loss_raw) / max(len(distill_loss_raw), 1)
+            else:
+                distill_loss = float(distill_loss_raw) if distill_loss_raw is not None else float("nan")
+            if isinstance(nll_loss_raw, list):
+                nll_loss = sum(nll_loss_raw) / max(len(nll_loss_raw), 1)
+            else:
+                nll_loss = float(nll_loss_raw) if nll_loss_raw is not None else float("nan")
             print(f"\n📊 Step {total_steps + 1} Results:")
             print(f"  • Loss (total): {train_loss:.4f}")
             print(f"  • Distill loss: {distill_loss:.4f}")
