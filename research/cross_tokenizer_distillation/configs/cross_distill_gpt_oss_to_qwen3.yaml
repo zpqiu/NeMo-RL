@@ -1,0 +1,189 @@
+# Cross-Tokenizer On-Policy Distillation Configuration
+# Teacher: openai/gpt-oss-20b (GPT tokenizer)
+# Student: Qwen/Qwen3-1.7B-Base (Qwen3 tokenizer, vocab=151936)
+#
+# Practical accuracy validation run with val/acc as primary metric.
+
+cross_distillation:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 100
+  max_num_epochs: 10
+  val_batch_size: 480
+  val_period: 5
+  val_at_start: true
+  val_at_end: false
+  max_val_samples: 480
+  seed: 42
+
+loss_fn:
+  kl_type: "mixed"
+  mixed_kl_weight: 0.5
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+  metric_name: "val/acc"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 5
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy: &STUDENT_BASE
+  model_name: "Qwen/Qwen3-1.7B-Base"
+  tokenizer:
+    name: ${..model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  generation_batch_size: 128
+  logprob_batch_size: 1
+  max_total_sequence_length: 6144
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg: &DTENSOR_BASE
+    enabled: true
+    _v2: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 4
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: False
+      fused: False
+
+  megatron_cfg:
+    enabled: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 10
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [10]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${..max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${...precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${...max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      distributed_executor_backend: null
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+# Teacher: openai/gpt-oss-20b (MoE model, different tokenizer family from student)
+teacher:
+  <<: *STUDENT_BASE
+  model_name: "openai/gpt-oss-20b"
+  dequantize_base_checkpoint: true
+  tokenizer:
+    name: ${..model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  dtensor_cfg:
+    <<: *DTENSOR_BASE
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 8
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.moe.utils.BackendConfig
+        attn: flex
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        enable_hf_state_dict_adapter: true
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  train:
+    dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 4
+
+logger:
+  log_dir: "logs/cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "nemo-cross-distillation"
+    name: "xdistill-gpt-oss-20b-to-qwen3-1.7b"
+  tensorboard:
+    log_dir: "tb_logs-cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

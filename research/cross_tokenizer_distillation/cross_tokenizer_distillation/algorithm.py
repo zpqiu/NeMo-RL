@@ -525,6 +525,105 @@ def setup(
 # ===============================================================================
 
 
+def validate(
+    policy_generation: GenerationInterface,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: CrossDistillMasterConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run validation on the validation dataset."""
+    if val_dataloader is None:
+        print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
+        return {}, {}
+
+    if val_task_to_env is None:
+        print("  ⚠️ No validation task to environment mapping provided, skipping validation", flush=True)
+        return {}, {}
+
+    timer = Timer()
+    with timer.time("total_validation_time"):
+        print(f"▶ Starting validation at step {step}...", flush=True)
+
+        total_rewards = []
+        total_lengths = []
+        all_message_logs = []
+
+        distill_config = master_config["cross_distillation"]
+        max_batches = distill_config["max_val_samples"] // distill_config["val_batch_size"]
+
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if _should_use_async_rollouts(master_config):
+                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=distill_config["max_rollout_turns"],
+                    greedy=False,
+                )
+            else:
+                val_batch, gen_metrics = run_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=distill_config["max_rollout_turns"],
+                    greedy=False,
+                )
+
+            total_rewards.extend(val_batch["total_reward"].tolist())
+            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+            to_env = [
+                get_keys_from_message_log(
+                    val_batch["message_log"][i], ["role", "content"]
+                )
+                for i in range(len(val_batch["message_log"]))
+            ]
+            all_message_logs.extend(to_env)
+
+        # Calculate validation metrics
+        accuracy = sum(total_rewards) / len(total_rewards) if total_rewards else 0
+        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0
+
+        val_metrics = {
+            "accuracy": accuracy,
+            "avg_length": avg_length,
+        }
+
+        try:
+            print_message_log_samples(
+                all_message_logs,
+                total_rewards,
+                num_samples=min(
+                    master_config["logger"]["num_val_samples_to_print"],
+                    len(all_message_logs),
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}", flush=True)
+
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+
+    print("\n📊 Validation Results:")
+    print(f"    • Accuracy: {accuracy:.4f}")
+    print(f"    • Average response length: {avg_length:.1f} tokens")
+    print(f"    • Samples processed: {len(total_rewards)}")
+    print(f"\n  ⏱️  Total validation time: {validation_time:.2f}s", flush=True)
+
+    timer.reset()
+    return val_metrics, timing_metrics
+
+
 def cross_tokenizer_distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -578,6 +677,25 @@ def cross_tokenizer_distillation_train(
     max_epochs = distill_config["max_num_epochs"]
     max_steps = distill_config["max_num_steps"]
     max_seq_len = master_config["policy"]["max_total_sequence_length"]
+    val_period = distill_config["val_period"]
+    val_at_start = distill_config.get("val_at_start", False)
+    val_at_end = distill_config.get("val_at_end", False)
+
+    # Run validation at the start if configured
+    if val_at_start and total_steps == 0:
+        print("\n🔍 Running initial validation...", flush=True)
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            refit_policy_generation(student_policy, student_generation, colocated_inference)
+            POLICY_GENERATION_STALE = False
+        else:
+            student_generation.prepare_for_generation()
+        val_metrics, validation_timings = validate(
+            student_generation, val_dataloader, student_tokenizer,
+            val_task_to_env, step=total_steps, master_config=master_config,
+        )
+        student_generation.finish_generation()
+        logger.log_metrics(val_metrics, total_steps, prefix="validation")
+        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
     batch: BatchedDataDict[DatumSpec]
 
@@ -850,6 +968,26 @@ def cross_tokenizer_distillation_train(
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"] == 0
                     or timeout.check_save()
                 )
+
+                # Run validation if it's a validation step or last step with val_at_end
+                should_validate = (
+                    (val_period > 0 and (total_steps + 1) % val_period == 0)
+                    or (val_at_end and is_last_step)
+                )
+                if should_validate:
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_policy_generation(student_policy, student_generation, colocated_inference)
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        student_generation.prepare_for_generation()
+                    val_metrics, validation_timings = validate(
+                        student_generation, val_dataloader, student_tokenizer,
+                        val_task_to_env, step=total_steps + 1, master_config=master_config,
+                    )
+                    student_generation.finish_generation()
+                    POLICY_GENERATION_STALE = True
+                    logger.log_metrics(val_metrics, total_steps + 1, prefix="validation")
+                    logger.log_metrics(validation_timings, total_steps + 1, prefix="timing/validation")
 
                 if master_config["checkpointing"]["enabled"] and should_save:
                     student_policy.prepare_for_training()

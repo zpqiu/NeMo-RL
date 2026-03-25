@@ -25,7 +25,7 @@ mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 export PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/research/cross_tokenizer_distillation:${PYTHONPATH:-}
 export NRL_FORCE_REBUILD_VENVS=true  # Required: container transformers lacks qwen2 fast tokenizer
 
-MODEL_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
+MODEL_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
 
 cd $PROJECT_ROOT
 
