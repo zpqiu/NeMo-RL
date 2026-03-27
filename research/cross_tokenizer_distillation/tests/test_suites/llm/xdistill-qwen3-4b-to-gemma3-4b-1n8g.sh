@@ -31,7 +31,7 @@ MODEL_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alex
 cd $PROJECT_ROOT
 
 uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
-    --config research/cross_tokenizer_distillation/configs/cross_distill_gpt_oss_to_qwen3.yaml \
+    --config research/cross_tokenizer_distillation/configs/cross_distill_qwen3_to_gemma3.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
     policy.model_name=$MODEL_DIR/google/gemma-3-4b-it \
     loss_fn.kl_type=is \
@@ -48,8 +48,8 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
 
 echo ""
 echo "============================================"
-echo "  Cross-Tokenizer Distillation: gpt-oss-20b -> Qwen3-1.7B"
-echo "  Experiment: Forward KL + NLL Anchor + Length Normalization"
+echo "  Cross-Tokenizer Distillation: Qwen3-4B -> Gemma-3-4B"
+echo "  Experiment: IS Loss + Terminal EOS + Per-Token Normalization"
 echo "============================================"
 
 echo ""

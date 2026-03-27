@@ -1,6 +1,6 @@
 # Cross-Tokenizer On-Policy Distillation Configuration
-# Teacher: openai/gpt-oss-20b (GPT tokenizer)
-# Student: Qwen/Qwen3-1.7B-Base (Qwen3 tokenizer, vocab=151936)
+# Teacher: Qwen/Qwen3-4B-Instruct-2507 (Qwen3 tokenizer)
+# Student: google/gemma-3-4b-it (Gemma tokenizer)
 #
 # Practical accuracy validation run with val/acc as primary metric.
 
@@ -26,7 +26,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+  checkpoint_dir: "checkpoints/cross-distill-qwen3-4b-to-gemma3-4b"
   metric_name: "val/acc"
   higher_is_better: true
   keep_top_k: 3
@@ -36,7 +36,7 @@ checkpointing:
   save_consolidated: false
 
 policy: &STUDENT_BASE
-  model_name: "Qwen/Qwen3-1.7B-Base"
+  model_name: "google/gemma-3-4b-it"
   tokenizer:
     name: ${..model_name}
     chat_template: null
@@ -129,11 +129,11 @@ policy: &STUDENT_BASE
         gpus_per_node: null
         num_nodes: null
 
-# Teacher: openai/gpt-oss-20b (MoE model, different tokenizer family from student)
+# Teacher: Qwen/Qwen3-4B-Instruct-2507 (different tokenizer family from student)
 teacher:
   <<: *STUDENT_BASE
-  model_name: "openai/gpt-oss-20b"
-  dequantize_base_checkpoint: true
+  model_name: "Qwen/Qwen3-4B-Instruct-2507"
+  dequantize_base_checkpoint: false
   tokenizer:
     name: ${..model_name}
     chat_template: null
@@ -143,15 +143,6 @@ teacher:
     tensor_parallel_size: 4
     context_parallel_size: 1
     expert_parallel_size: 1
-    # automodel_kwargs:
-    #   backend:
-    #     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    #     attn: flex
-    #     linear: te
-    #     rms_norm: te
-    #     enable_deepep: true
-    #     fake_balanced_gate: false
-    #     enable_hf_state_dict_adapter: true
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -171,7 +162,7 @@ env:
     num_workers: 4
 
 logger:
-  log_dir: "logs/cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+  log_dir: "logs/cross-distill-qwen3-4b-to-gemma3-4b"
   num_val_samples_to_print: 3
   wandb_enabled: false
   tensorboard_enabled: true
@@ -180,9 +171,9 @@ logger:
   monitor_gpus: true
   wandb:
     project: "nemo-cross-distillation"
-    name: "xdistill-gpt-oss-20b-to-qwen3-1.7b"
+    name: "xdistill-qwen3-4b-to-gemma3-4b"
   tensorboard:
-    log_dir: "tb_logs-cross-distill-gpt-oss-20b-to-qwen3-1.7b"
+    log_dir: "tb_logs-cross-distill-qwen3-4b-to-gemma3-4b"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
