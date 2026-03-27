@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Token alignment across different tokenizers via byte-offset mapping."""
+"""Token alignment across different tokenizers."""
 
 from __future__ import annotations
 
@@ -122,6 +122,79 @@ def _get_token_byte_spans(
     return token_ids, spans
 
 
+def get_visible_pieces_from_original_ids(
+    tokenizer,
+    original_ids: list[int],
+) -> tuple[list[int], list[bytes], list[int]]:
+    """Extract visible text pieces from *original* generated token IDs.
+
+    Uses prefix decoding with ``skip_special_tokens=True`` so the pieces
+    exactly reproduce the text obtained by ``tokenizer.decode(original_ids,
+    skip_special_tokens=True)``.  Tokens that contribute no visible text
+    (EOS, BOS, ``<unused*>``, …) are dropped.
+
+    Returns:
+        ``(visible_ids, pieces, original_indices)`` where
+        ``original_indices[i]`` is the position of ``visible_ids[i]``
+        in *original_ids*.
+    """
+    visible_ids: list[int] = []
+    pieces: list[bytes] = []
+    original_indices: list[int] = []
+
+    prefix_ids: list[int] = []
+    prev_decoded = ""
+    for i, tid in enumerate(original_ids):
+        prefix_ids.append(tid)
+        decoded = tokenizer.decode(
+            prefix_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if len(decoded) > len(prev_decoded) and decoded.startswith(prev_decoded):
+            piece_text = decoded[len(prev_decoded):]
+            visible_ids.append(tid)
+            pieces.append(piece_text.encode("utf-8"))
+            original_indices.append(i)
+            prev_decoded = decoded
+        # Tokens that don't grow the decoded string are invisible (special)
+        # and are silently skipped.
+
+    return visible_ids, pieces, original_indices
+
+
+def _get_token_ids_and_pieces(
+    text: str,
+    tokenizer,
+) -> tuple[list[int], list[bytes]]:
+    """Tokenize text and recover per-token visible text pieces as UTF-8 bytes."""
+    enc = tokenizer(text, add_special_tokens=False)
+    token_ids = enc["input_ids"]
+    pieces: list[bytes] = []
+
+    prefix_ids: list[int] = []
+    prev_decoded = ""
+    for token_id in token_ids:
+        prefix_ids.append(token_id)
+        decoded = tokenizer.decode(
+            prefix_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if decoded.startswith(prev_decoded):
+            piece = decoded[len(prev_decoded) :]
+        else:
+            piece = tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        pieces.append(piece.encode("utf-8"))
+        prev_decoded = decoded
+
+    return token_ids, pieces
+
+
 def align_tokens_by_byte_offset(
     text: str,
     teacher_tokenizer,
@@ -214,6 +287,95 @@ def align_tokens_by_byte_offset(
     )
 
 
+def align_tokens_by_decoded_pieces(
+    text: str,
+    teacher_tokenizer,
+    student_tokenizer,
+    student_token_ids: list[int] | None = None,
+    student_pieces: list[bytes] | None = None,
+) -> AlignmentResult:
+    """Align two tokenizations by greedily matching decoded token-piece groups.
+
+    This follows the same spirit as GOLD: each side accumulates decoded token
+    pieces until both represent the same visible text span, then emits one
+    shared alignment group.
+
+    When *student_token_ids* and *student_pieces* are provided they are used
+    directly (no re-tokenisation on the student side).  This is critical for
+    correctness: the indices in the returned chunks then reference positions in
+    the **original** generated sequence rather than a re-encoded copy.
+    """
+    teacher_ids, teacher_pieces = _get_token_ids_and_pieces(text, teacher_tokenizer)
+    if student_token_ids is not None and student_pieces is not None:
+        student_ids = student_token_ids
+    else:
+        student_ids, student_pieces = _get_token_ids_and_pieces(text, student_tokenizer)
+
+    chunks: list[AlignmentChunk] = []
+    matched_bytes = 0
+    teacher_idx = 0
+    student_idx = 0
+    teacher_buf = b""
+    student_buf = b""
+    teacher_group: list[int] = []
+    student_group: list[int] = []
+
+    while teacher_idx < len(teacher_pieces) or student_idx < len(student_pieces):
+        if teacher_buf == student_buf and teacher_buf and teacher_group and student_group:
+            span_len = len(teacher_buf)
+            chunks.append(
+                AlignmentChunk(
+                    byte_start=matched_bytes,
+                    byte_end=matched_bytes + span_len,
+                    teacher_token_indices=list(teacher_group),
+                    student_token_indices=list(student_group),
+                )
+            )
+            matched_bytes += span_len
+            teacher_buf = b""
+            student_buf = b""
+            teacher_group = []
+            student_group = []
+
+        take_teacher = (
+            student_idx >= len(student_pieces)
+            or (teacher_idx < len(teacher_pieces) and len(teacher_buf) <= len(student_buf))
+        )
+        if take_teacher and teacher_idx < len(teacher_pieces):
+            teacher_buf += teacher_pieces[teacher_idx]
+            teacher_group.append(teacher_idx)
+            teacher_idx += 1
+        elif student_idx < len(student_pieces):
+            student_buf += student_pieces[student_idx]
+            student_group.append(student_idx)
+            student_idx += 1
+
+    if teacher_buf == student_buf and teacher_buf and teacher_group and student_group:
+        span_len = len(teacher_buf)
+        chunks.append(
+            AlignmentChunk(
+                byte_start=matched_bytes,
+                byte_end=matched_bytes + span_len,
+                teacher_token_indices=list(teacher_group),
+                student_token_indices=list(student_group),
+            )
+        )
+    elif teacher_buf or student_buf or teacher_group or student_group:
+        # Fall back to the more forgiving byte-offset alignment if the decoded
+        # pieces do not compose cleanly into the same visible text.
+        # NOTE: the byte-offset fallback always re-tokenizes both sides, so
+        # the caller must remap student indices afterwards if original ids
+        # were supplied.
+        return align_tokens_by_byte_offset(text, teacher_tokenizer, student_tokenizer)
+
+    return AlignmentResult(
+        text=text,
+        teacher_token_ids=teacher_ids,
+        student_token_ids=student_ids,
+        chunks=chunks,
+    )
+
+
 def compute_chunk_logprobs(
     token_logprobs: torch.Tensor,
     chunks: list[AlignmentChunk],
@@ -243,6 +405,55 @@ def compute_chunk_logprobs(
     if not chunk_lps:
         return torch.zeros(0, device=token_logprobs.device)
     return torch.stack(chunk_lps)
+
+
+def merge_alignment_chunks(
+    alignment: AlignmentResult,
+    min_bytes: int = 0,
+) -> AlignmentResult:
+    """Merge adjacent alignment chunks into coarser shared text spans.
+
+    Minimal byte-level chunks are often too fine for cross-tokenizer training and
+    create thousands of boundaries per sample. Coarsening them gives a more
+    stable shared event space for sequence-level distillation.
+    """
+    if min_bytes <= 0 or alignment.num_chunks <= 1:
+        return alignment
+
+    merged_chunks: list[AlignmentChunk] = []
+    pending: AlignmentChunk | None = None
+
+    for chunk in alignment.chunks:
+        if pending is None:
+            pending = AlignmentChunk(
+                byte_start=chunk.byte_start,
+                byte_end=chunk.byte_end,
+                teacher_token_indices=list(chunk.teacher_token_indices),
+                student_token_indices=list(chunk.student_token_indices),
+            )
+        else:
+            pending.byte_end = chunk.byte_end
+            pending.teacher_token_indices.extend(chunk.teacher_token_indices)
+            pending.student_token_indices.extend(chunk.student_token_indices)
+
+        if pending.byte_end - pending.byte_start >= min_bytes:
+            merged_chunks.append(pending)
+            pending = None
+
+    if pending is not None:
+        if merged_chunks:
+            merged_chunks[-1].byte_end = pending.byte_end
+            merged_chunks[-1].teacher_token_indices.extend(pending.teacher_token_indices)
+            merged_chunks[-1].student_token_indices.extend(pending.student_token_indices)
+        else:
+            merged_chunks.append(pending)
+
+    return AlignmentResult(
+        text=alignment.text,
+        teacher_token_ids=alignment.teacher_token_ids,
+        student_token_ids=alignment.student_token_ids,
+        chunks=merged_chunks,
+    )
 
 
 def batch_align(

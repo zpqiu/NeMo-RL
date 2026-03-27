@@ -33,10 +33,11 @@ cd $PROJECT_ROOT
 uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     --config research/cross_tokenizer_distillation/configs/cross_distill_gpt_oss_to_qwen3.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
-    cross_distillation.val_at_start=true \
-    policy.model_name=$MODEL_DIR/Qwen/Qwen3-1.7B-Base \
-    policy.optimizer.kwargs.lr=1e-6 \
-    teacher.model_name=$MODEL_DIR/openai/gpt-oss-20b \
+    policy.model_name=$MODEL_DIR/google/gemma-3-4b-it \
+    loss_fn.kl_type=is \
+    loss_fn.clip_epsilon=0.2 \
+    policy.optimizer.kwargs.lr=5e-6 \
+    teacher.model_name=$MODEL_DIR/Qwen/Qwen3-4B-Instruct-2507 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.tensorboard_enabled=False \
@@ -62,3 +63,4 @@ grep "Loss (chunk KL)" $RUN_LOG || echo "No loss found"
 echo ""
 echo "=== Sample Outputs ==="
 grep "Sample text" $RUN_LOG || echo "No sample text found"
+

@@ -223,22 +223,29 @@ class TestTrainLoss:
         xalign_mask = torch.zeros(1, pad_dim)
         xalign_mask[0, :n_chunks] = 1.0
         xalign_num_toks = torch.zeros(1, pad_dim, dtype=torch.long)
+        xalign_num_teacher_toks = torch.zeros(1, pad_dim, dtype=torch.long)
         xalign_start = torch.zeros(1, pad_dim, dtype=torch.long)
         for c_idx, chunk in enumerate(alignment.chunks):
             n_t = len(chunk.student_token_indices)
             xalign_num_toks[0, c_idx] = n_t
+            xalign_num_teacher_toks[0, c_idx] = len(chunk.teacher_token_indices)
             if n_t > 0:
                 xalign_start[0, c_idx] = chunk.student_token_indices[0]
 
         data = {
             "input_ids": torch.randint(1, 100, (1, total_seq_len)),
-            "input_lengths": torch.tensor([prompt_len]),
+            "input_lengths": torch.tensor([total_seq_len]),
             "token_mask": torch.ones(1, total_seq_len, dtype=torch.long),
             "sample_mask": torch.ones(1, dtype=torch.float32),
+            "xalign_prompt_lengths": torch.tensor([prompt_len]),
             "xalign_teacher_chunk_logprobs": xalign_teacher,
             "xalign_chunk_student_start": xalign_start,
             "xalign_chunk_mask": xalign_mask,
             "xalign_num_student_toks": xalign_num_toks,
+            "xalign_num_teacher_toks": xalign_num_teacher_toks,
+            "xalign_teacher_terminal_eos_logprob": torch.tensor([-0.2]),
+            "xalign_student_terminal_eos_token_pos": torch.tensor([total_seq_len - 1]),
+            "xalign_terminal_eos_mask": torch.tensor([1.0]),
         }
 
         # Simulate next_token_logprobs from forward pass
@@ -269,6 +276,26 @@ class TestTrainLoss:
         )
         loss.backward()
         assert next_token_logprobs.grad is not None
+
+    def test_train_loss_terminal_eos_only(self):
+        data, next_token_logprobs, _ = self._make_mock_data()
+        data["xalign_chunk_mask"].zero_()
+        data["xalign_num_student_toks"].zero_()
+        data["xalign_num_teacher_toks"].zero_()
+
+        loss_fn = CrossTokenizerTrainLossFn(
+            {"kl_type": "forward", "mixed_kl_weight": 0.5, "terminal_eos_weight": 1.0}
+        )
+        loss, metrics = loss_fn(
+            data=data,
+            global_valid_seqs=torch.tensor(1),
+            global_valid_toks=torch.tensor(1),
+            next_token_logprobs=next_token_logprobs,
+        )
+
+        assert loss.requires_grad
+        assert metrics["num_chunks"] == 0
+        assert metrics["num_valid_terminal_eos"] == 1
 
     def test_train_loss_all_kl_types(self):
         for kl_type in ["forward", "reverse", "mixed"]:

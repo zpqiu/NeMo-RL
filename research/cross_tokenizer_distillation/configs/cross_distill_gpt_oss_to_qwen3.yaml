@@ -12,7 +12,7 @@ cross_distillation:
   max_num_epochs: 10
   val_batch_size: 480
   val_period: 5
-  val_at_start: true
+  val_at_start: false
   val_at_end: false
   max_val_samples: 480
   seed: 42
@@ -20,7 +20,9 @@ cross_distillation:
 loss_fn:
   kl_type: "forward"
   mixed_kl_weight: 0.5
-  nll_anchor_weight: 0.1
+  nll_anchor_weight: 0.0
+  terminal_eos_weight: 1.0
+  clip_epsilon: 0.2
 
 checkpointing:
   enabled: true
@@ -138,18 +140,18 @@ teacher:
     chat_template_kwargs: null
   dtensor_cfg:
     <<: *DTENSOR_BASE
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
-    expert_parallel_size: 8
-    automodel_kwargs:
-      backend:
-        _target_: nemo_automodel.components.moe.utils.BackendConfig
-        attn: flex
-        linear: te
-        rms_norm: te
-        enable_deepep: true
-        fake_balanced_gate: false
-        enable_hf_state_dict_adapter: true
+    expert_parallel_size: 1
+    # automodel_kwargs:
+    #   backend:
+    #     _target_: nemo_automodel.components.moe.utils.BackendConfig
+    #     attn: flex
+    #     linear: te
+    #     rms_norm: te
+    #     enable_deepep: true
+    #     fake_balanced_gate: false
+    #     enable_hf_state_dict_adapter: true
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
