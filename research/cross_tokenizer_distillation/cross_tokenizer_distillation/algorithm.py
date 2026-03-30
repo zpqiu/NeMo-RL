@@ -70,9 +70,9 @@ from cross_tokenizer_distillation.cross_tokenizer_loss import (
 from cross_tokenizer_distillation.token_alignment import (
     AlignmentChunk,
     AlignmentResult,
-    align_tokens_by_decoded_pieces,
+    align_tokens_from_original_student_ids,
+    align_tokens_from_original_student_ids_with_stats,
     compute_chunk_logprobs,
-    get_visible_pieces_from_original_ids,
     merge_alignment_chunks,
 )
 
@@ -301,7 +301,7 @@ def decode_and_align(
     student_tokenizer: PreTrainedTokenizerBase,
     teacher_tokenizer: PreTrainedTokenizerBase,
     min_chunk_bytes: int = 0,
-) -> tuple[list[str], list[AlignmentResult]]:
+) -> tuple[list[str], list[AlignmentResult], dict[str, int]]:
     """Decode student-generated text and compute cross-tokenizer alignment.
 
     Args:
@@ -316,6 +316,13 @@ def decode_and_align(
     batch_size = generated_ids.shape[0]
     decoded_texts: list[str] = []
     alignments: list[AlignmentResult] = []
+    alignment_stats: dict[str, int] = {
+        "student_fast_path_hits": 0,
+        "student_fast_path_misses": 0,
+        "student_visible_piece_path_hits": 0,
+        "piece_greedy_hits": 0,
+        "piece_span_fallback_hits": 0,
+    }
 
     for i in range(batch_size):
         prompt_len = int(input_lengths[i].item())
@@ -349,14 +356,26 @@ def decode_and_align(
             )
             continue
 
-        text = student_tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
+        gen_id_list = gen_ids.tolist()
+        text = student_tokenizer.decode(
+            gen_id_list,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
         decoded_texts.append(text)
 
-        alignment = align_tokens_by_decoded_pieces(text, teacher_tokenizer, student_tokenizer)
+        alignment, sample_stats = align_tokens_from_original_student_ids_with_stats(
+            text=text,
+            teacher_tokenizer=teacher_tokenizer,
+            student_tokenizer=student_tokenizer,
+            original_student_token_ids=gen_id_list,
+        )
+        for key, value in sample_stats.items():
+            alignment_stats[key] = alignment_stats.get(key, 0) + value
         alignment = merge_alignment_chunks(alignment, min_bytes=min_chunk_bytes)
         alignments.append(alignment)
 
-    return decoded_texts, alignments
+    return decoded_texts, alignments, alignment_stats
 
 
 def pack_alignment_into_data(
@@ -966,28 +985,38 @@ def cross_tokenizer_distillation_train(
                 # Extract prompt lengths from message log (not input_lengths which is total)
                 print("▶ Decoding text & computing cross-tokenizer alignment...", flush=True)
                 with timer.time("alignment"):
-                    # Compute prompt-only lengths
-                    prompt_lengths = []
-                    for msg_log in distill_message_logs:
-                        plen = 0
-                        for msg in msg_log:
-                            if msg["role"] != "assistant":
-                                plen += msg["token_ids"].shape[0]
-                            else:
-                                break  # Stop at first assistant message
-                        prompt_lengths.append(plen)
-                    prompt_lengths_tensor = torch.tensor(prompt_lengths, dtype=torch.long)
+                    with timer.time("alignment_prompt_lengths"):
+                        prompt_lengths = []
+                        for msg_log in distill_message_logs:
+                            plen = 0
+                            for msg in msg_log:
+                                if msg["role"] != "assistant":
+                                    plen += msg["token_ids"].shape[0]
+                                else:
+                                    break  # Stop at first assistant message
+                            prompt_lengths.append(plen)
+                        prompt_lengths_tensor = torch.tensor(prompt_lengths, dtype=torch.long)
 
-                    decoded_texts, alignments = decode_and_align(
-                        generated_ids=student_input_ids,
-                        input_lengths=prompt_lengths_tensor,
-                        student_tokenizer=student_tokenizer,
-                        teacher_tokenizer=teacher_tokenizer,
-                    )
+                    with timer.time("alignment_decode_and_align"):
+                        decoded_texts, alignments, alignment_path_stats = decode_and_align(
+                            generated_ids=student_input_ids,
+                            input_lengths=prompt_lengths_tensor,
+                            student_tokenizer=student_tokenizer,
+                            teacher_tokenizer=teacher_tokenizer,
+                        )
                     # Debug: print alignment stats
                     n_nonempty = sum(1 for t in decoded_texts if t.strip())
                     n_chunks_total = sum(a.num_chunks for a in alignments)
                     print(f"  ⚙️  Decoded {len(decoded_texts)} texts, {n_nonempty} non-empty, {n_chunks_total} total chunks", flush=True)
+                    print(
+                        "  ⚙️  Alignment paths:"
+                        f" fast_path={alignment_path_stats.get('student_fast_path_hits', 0)}"
+                        f"  fast_path_miss={alignment_path_stats.get('student_fast_path_misses', 0)}"
+                        f"  visible_piece={alignment_path_stats.get('student_visible_piece_path_hits', 0)}"
+                        f"  piece_greedy={alignment_path_stats.get('piece_greedy_hits', 0)}"
+                        f"  piece_fallback={alignment_path_stats.get('piece_span_fallback_hits', 0)}",
+                        flush=True,
+                    )
                     if n_nonempty > 0:
                         sample_text = next(t for t in decoded_texts if t.strip())
                         print(f"  ⚙️  Sample text (first 100 chars): {sample_text[:100]!r}", flush=True)
@@ -1008,14 +1037,15 @@ def cross_tokenizer_distillation_train(
                         text_raw = student_tokenizer.decode(non_pad[:50].tolist(), skip_special_tokens=False) if non_pad.numel() > 0 else "(all pad)"
                         print(f"  ⚙️  Raw decode (first 50 non-pad): {text_raw[:100]!r}", flush=True)
 
-                    student_train_input_ids, student_train_token_mask, student_train_input_lengths, student_terminal_eos_pos, student_terminal_eos_mask = _append_terminal_eos_for_training(
-                        input_ids=student_input_ids,
-                        token_mask=student_token_mask,
-                        input_lengths=input_lengths,
-                        eos_token_id=student_tokenizer.eos_token_id,
-                        pad_token_id=student_tokenizer.pad_token_id or 0,
-                        max_seq_len=max_seq_len,
-                    )
+                    with timer.time("alignment_append_terminal_eos"):
+                        student_train_input_ids, student_train_token_mask, student_train_input_lengths, student_terminal_eos_pos, student_terminal_eos_mask = _append_terminal_eos_for_training(
+                            input_ids=student_input_ids,
+                            token_mask=student_token_mask,
+                            input_lengths=input_lengths,
+                            eos_token_id=student_tokenizer.eos_token_id,
+                            pad_token_id=student_tokenizer.pad_token_id or 0,
+                            max_seq_len=max_seq_len,
+                        )
 
                 # ---- 5) Get teacher logprobs ----
                 # Build teacher input: re-tokenize the student-generated text
@@ -1348,6 +1378,10 @@ def cross_tokenizer_distillation_train(
             # Logging
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
             total_time = timing_metrics.get("total_step_time", 0)
+            alignment_total = timing_metrics.get("alignment", 0.0)
+            alignment_prompt_lengths = timing_metrics.get("alignment_prompt_lengths", 0.0)
+            alignment_decode_and_align = timing_metrics.get("alignment_decode_and_align", 0.0)
+            alignment_append_terminal_eos = timing_metrics.get("alignment_append_terminal_eos", 0.0)
 
             train_loss = metrics.get("loss", float("nan"))
             distill_loss_raw = metrics.get("distill_loss", float("nan"))
@@ -1366,14 +1400,48 @@ def cross_tokenizer_distillation_train(
             s_zero = _mean_metric_value(metrics.get("student_zero_pct", 0))
             t_mean_lp = _mean_metric_value(metrics.get("mean_teacher_pertok_lp", 0))
             s_mean_lp = _mean_metric_value(metrics.get("mean_student_pertok_lp", 0))
+            terminal_eos_loss = _mean_metric_value(metrics.get("terminal_eos_loss", 0))
             print(f"\n📊 Step {total_steps + 1} Results:")
             print(f"  • Loss (total): {train_loss:.4f}")
             print(f"  • Distill loss: {distill_loss:.4f}")
+            print(f"  • Chunk distill loss: {_mean_metric_value(metrics.get('chunk_distill_loss', 0)):.4f}")
+            print(f"  • Terminal EOS loss: {terminal_eos_loss:.4f}")
             print(f"  • NLL loss: {nll_loss:.4f}")
             print(f"  • Chunks: {int(alignment_data['xalign_chunk_mask'].sum().item())}")
             print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
             print(f"  • Teacher zero chunks: {t_zero:.1f}%  |  Student zero chunks: {s_zero:.1f}%")
             print(f"  • Mean teacher per-tok lp: {t_mean_lp:.4f}  |  Mean student per-tok lp: {s_mean_lp:.4f}")
+            if master_config["loss_fn"].get("kl_type") == "is":
+                adv_norm_mode = master_config["loss_fn"].get("advantage_normalization", "center")
+                neg_adv_weight = master_config["loss_fn"].get("negative_advantage_weight", 1.0)
+                print(
+                    "  • IS stats:"
+                    f" raw_adv_mean={_mean_metric_value(metrics.get('is_mean_raw_advantage', 0)):.4f}"
+                    f"  raw_pos_adv_frac={_mean_metric_value(metrics.get('is_raw_pos_adv_frac', 0)):.3f}"
+                    f"  adv_mean={_mean_metric_value(metrics.get('is_mean_advantage', 0)):.4f}"
+                    f"  pos_adv_frac={_mean_metric_value(metrics.get('is_pos_adv_frac', 0)):.3f}"
+                    f"  ratio_mean={_mean_metric_value(metrics.get('is_mean_ratio', 0)):.4f}"
+                    f"  clip_frac={_mean_metric_value(metrics.get('is_clip_frac', 0)):.3f}"
+                )
+                print(
+                    "  • IS components:"
+                    f" chunk_mean={_mean_metric_value(metrics.get('is_mean_chunk_loss', 0)):.4f}"
+                    f"  terminal_mean={_mean_metric_value(metrics.get('is_mean_terminal_loss', 0)):.4f}"
+                )
+                print(
+                    "  • IS advantage norm:"
+                    f" mode={adv_norm_mode}"
+                    f"  neg_weight={neg_adv_weight:.2f}"
+                    f"  center={_mean_metric_value(metrics.get('is_advantage_center', 0)):.4f}"
+                    f"  scale={_mean_metric_value(metrics.get('is_advantage_scale', 1)):.4f}"
+                )
+            print(
+                "  • Alignment timing:"
+                f" total={alignment_total:.2f}s"
+                f"  prompt_lengths={alignment_prompt_lengths:.2f}s"
+                f"  decode_and_align={alignment_decode_and_align:.2f}s"
+                f"  append_terminal_eos={alignment_append_terminal_eos:.2f}s"
+            )
             print(f"\n⏱️  Timing: {total_time:.2f}s total", flush=True)
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

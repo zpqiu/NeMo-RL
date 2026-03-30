@@ -68,6 +68,8 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     nll_anchor_weight: float  # Weight for NLL anchor loss (0 = disabled, >0 = blended)
     terminal_eos_weight: float  # Weight for terminal stop supervision.
     clip_epsilon: float  # PPO clip range for importance sampling (kl_type="is")
+    advantage_normalization: str  # none|center|standardize for IS advantages
+    negative_advantage_weight: float  # Scale factor for negative IS advantages
 
 
 # ===================================================================
@@ -99,6 +101,66 @@ def _compute_chunk_kl(
     else:
         # Mixed: use absolute difference (symmetric loss)
         return diff.abs()
+
+
+def _compute_is_ratio_terms(
+    current_student_logprob: torch.Tensor,
+    old_student_logprob: torch.Tensor,
+    clip_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return unclipped and clipped IS ratios for the current event."""
+    log_ratio = current_student_logprob - old_student_logprob.detach()
+    ratio = torch.exp(log_ratio)
+    clipped_ratio = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+    return ratio, clipped_ratio
+
+
+def _compute_is_loss_from_advantage(
+    advantage: torch.Tensor,
+    ratio: torch.Tensor,
+    clipped_ratio: torch.Tensor,
+    negative_advantage_weight: float = 1.0,
+) -> torch.Tensor:
+    """Clipped importance-weighted surrogate from a precomputed advantage."""
+    if negative_advantage_weight < 1.0:
+        advantage = torch.where(
+            advantage >= 0,
+            advantage,
+            advantage * negative_advantage_weight,
+        )
+    surr1 = advantage * ratio
+    surr2 = advantage * clipped_ratio
+    return -torch.where(
+        advantage >= 0,
+        torch.min(surr1, surr2),
+        torch.max(surr1, surr2),
+    )
+
+
+def _normalize_advantages(
+    advantages: list[torch.Tensor],
+    mode: str,
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Normalize detached IS advantages across the current batch of valid events."""
+    if not advantages:
+        zero = torch.tensor(0.0)
+        one = torch.tensor(1.0)
+        return [], zero, one
+
+    stacked = torch.stack(advantages)
+    mean = stacked.mean()
+    if mode == "none":
+        normalized = advantages
+        scale = torch.tensor(1.0, device=mean.device, dtype=mean.dtype)
+    elif mode == "center":
+        normalized = [adv - mean for adv in advantages]
+        scale = torch.tensor(1.0, device=mean.device, dtype=mean.dtype)
+    elif mode == "standardize":
+        scale = stacked.std(unbiased=False).clamp(min=1e-6)
+        normalized = [(adv - mean) / scale for adv in advantages]
+    else:
+        raise ValueError(f"Unsupported advantage_normalization: {mode}")
+    return normalized, mean, scale
 
 
 def _token_position_to_logprob_index(
@@ -208,9 +270,13 @@ class CrossTokenizerTrainLossFn:
         self.nll_anchor_weight = cfg.get("nll_anchor_weight", 0.0)
         self.terminal_eos_weight = cfg.get("terminal_eos_weight", 1.0)
         self.clip_epsilon = cfg.get("clip_epsilon", 0.2)
+        self.advantage_normalization = cfg.get("advantage_normalization", "center")
+        self.negative_advantage_weight = cfg.get("negative_advantage_weight", 1.0)
         assert self.kl_type in ("forward", "reverse", "mixed", "mse", "is")
         assert 0 <= self.mixed_kl_weight <= 1
         assert self.terminal_eos_weight >= 0
+        assert self.advantage_normalization in ("none", "center", "standardize")
+        assert 0 <= self.negative_advantage_weight <= 1
 
     def __call__(
         self,
@@ -242,10 +308,27 @@ class CrossTokenizerTrainLossFn:
             sample_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
         else:
             sample_mask = sample_mask.to(device=device, dtype=torch.float32)
+        prev_lps = data.get("prev_logprobs")
+        if self.kl_type == "is":
+            assert prev_lps is not None, "prev_logprobs are required when kl_type='is'"
+            prev_lps = prev_lps.to(device)
+            # NeMo get_logprobs preserves sequence length by prepending a dummy
+            # logprob for token 0, while next_token_logprobs is length S-1.
+            if prev_lps.shape[1] == next_token_logprobs.shape[1] + 1:
+                prev_lps = prev_lps[:, 1:]
+            elif prev_lps.shape[1] != next_token_logprobs.shape[1]:
+                raise ValueError(
+                    "prev_logprobs must be either sequence-length aligned "
+                    "(B, S) or next-token aligned (B, S-1); got "
+                    f"{tuple(prev_lps.shape)} vs next_token_logprobs "
+                    f"{tuple(next_token_logprobs.shape)}"
+                )
 
         # Aggregate per-sample chunk loss and average over valid samples.
         sample_chunk_losses = [next_token_logprobs.sum() * 0.0 for _ in range(batch_size)]
         sample_chunk_counts = [0 for _ in range(batch_size)]
+        is_chunk_events: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        is_terminal_events: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         all_student_tok_counts = []
         all_teacher_tok_counts = []
         # Debug stats for teacher/student logprob health
@@ -254,6 +337,11 @@ class CrossTokenizerTrainLossFn:
         _n_s_zero = 0  # chunks where student per-token logprob == 0
         _t_lp_sum = 0.0
         _s_lp_sum = 0.0
+        is_raw_advantages: list[float] = []
+        is_advantages: list[float] = []
+        is_ratios: list[float] = []
+        is_clipped_ratios: list[float] = []
+        is_chunk_losses: list[float] = []
 
         for b in range(batch_size):
             prompt_len = int(prompt_lengths[b].item())
@@ -271,9 +359,10 @@ class CrossTokenizerTrainLossFn:
                 max_lp_idx = next_token_logprobs.shape[1]
                 lp_start = max(0, min(lp_start, max_lp_idx - 1))
                 lp_end = max(lp_start + 1, min(lp_end, max_lp_idx))
-                # Normalize to per-token logprobs.
-                curr_s_per_tok = next_token_logprobs[b, lp_start:lp_end].sum() / n_s_toks
-                t_per_tok = teacher_chunk_lps[b, c] / n_t_toks
+                curr_s_chunk_lp = next_token_logprobs[b, lp_start:lp_end].sum()
+                t_chunk_lp = teacher_chunk_lps[b, c]
+                curr_s_per_tok = curr_s_chunk_lp / n_s_toks
+                t_per_tok = t_chunk_lp / n_t_toks
 
                 # Note: zero teacher logprobs (fp32 softmax saturation) are
                 # NOT skipped.  For IS loss, they produce a mild positive
@@ -281,28 +370,21 @@ class CrossTokenizerTrainLossFn:
                 # advantages from chunks where the teacher disagrees.
 
                 if self.kl_type == "is":
-                    # Importance-sampling loss (TML-style):
-                    #   advantage = teacher_per_tok - old_student_per_tok
-                    #   ratio     = exp(current - old)
+                    # Importance-sampling loss over the whole aligned chunk
+                    # event, not tokenizer-specific per-token averages:
+                    #   advantage = teacher_chunk_lp - old_student_chunk_lp
+                    #   ratio     = exp(current_chunk_lp - old_chunk_lp)
                     #   loss      = -advantage * clipped_ratio
-                    prev_lps = data["prev_logprobs"]
+                    assert prev_lps is not None
                     max_prev_idx = prev_lps.shape[1]
                     prev_start = max(0, min(lp_start, max_prev_idx - 1))
                     prev_end = max(prev_start + 1, min(lp_end, max_prev_idx))
-                    old_s_per_tok = prev_lps[b, prev_start:prev_end].sum() / n_s_toks
-
-                    advantage = (t_per_tok - old_s_per_tok).detach()
-                    log_ratio = curr_s_per_tok - old_s_per_tok.detach()
-                    ratio = torch.exp(log_ratio)
-                    clipped_ratio = torch.clamp(ratio,
-                                                1 - self.clip_epsilon,
-                                                1 + self.clip_epsilon)
-                    surr1 = advantage * ratio
-                    surr2 = advantage * clipped_ratio
-                    chunk_loss = -torch.where(
-                        advantage >= 0,
-                        torch.min(surr1, surr2),
-                        torch.max(surr1, surr2),
+                    old_s_chunk_lp = prev_lps[b, prev_start:prev_end].sum()
+                    raw_advantage = (t_chunk_lp - old_s_chunk_lp).detach()
+                    ratio, clipped_ratio = _compute_is_ratio_terms(
+                        current_student_logprob=curr_s_chunk_lp,
+                        old_student_logprob=old_s_chunk_lp,
+                        clip_epsilon=self.clip_epsilon,
                     )
                 else:
                     # MSE / forward / reverse / mixed KL (existing path)
@@ -313,8 +395,6 @@ class CrossTokenizerTrainLossFn:
                         self.mixed_kl_weight,
                     ).squeeze(0)
 
-                sample_chunk_losses[b] = sample_chunk_losses[b] + chunk_loss
-                sample_chunk_counts[b] += 1
                 all_student_tok_counts.append(n_s_toks)
                 all_teacher_tok_counts.append(n_t_toks)
 
@@ -327,32 +407,12 @@ class CrossTokenizerTrainLossFn:
                     _n_s_zero += 1
                 _t_lp_sum += _t_val
                 _s_lp_sum += _s_val
-
-        # Average over chunks within each sample (not sum) so that loss
-        # does not scale with sequence length / number of chunks.
-        for b in range(batch_size):
-            if sample_chunk_counts[b] > 0:
-                sample_chunk_losses[b] = sample_chunk_losses[b] / sample_chunk_counts[b]
-
-        sample_chunk_loss_tensor = torch.stack(sample_chunk_losses)
-        valid_chunk_sample_mask = torch.tensor(
-            [count > 0 for count in sample_chunk_counts],
-            dtype=torch.float32,
-            device=device,
-        )
-
-        if valid_chunk_sample_mask.sum() == 0:
-            trajectory_gap_loss = next_token_logprobs.sum() * 0.0
-            s_tok_counts = torch.zeros(0, dtype=torch.float32, device=device)
-            t_tok_counts = torch.zeros(0, dtype=torch.float32, device=device)
-        else:
-            s_tok_counts = torch.tensor(all_student_tok_counts, dtype=torch.float32, device=device)
-            t_tok_counts = torch.tensor(all_teacher_tok_counts, dtype=torch.float32, device=device)
-            trajectory_gap_loss = masked_mean(
-                sample_chunk_loss_tensor,
-                valid_chunk_sample_mask * sample_mask,
-                global_normalization_factor=None,
-            )
+                if self.kl_type == "is":
+                    is_chunk_events.append((b, raw_advantage, ratio, clipped_ratio))
+                    is_raw_advantages.append(float(raw_advantage.item()))
+                else:
+                    sample_chunk_losses[b] = sample_chunk_losses[b] + chunk_loss
+                    sample_chunk_counts[b] += 1
 
         terminal_eos_loss = next_token_logprobs.sum() * 0.0
         num_valid_terminal_eos = 0
@@ -384,22 +444,105 @@ class CrossTokenizerTrainLossFn:
                     )
                     if lp_idx is None or lp_idx >= next_token_logprobs.shape[1]:
                         continue
-                    terminal_eos_kl = _compute_chunk_kl(
-                        teacher_terminal_eos[b].unsqueeze(0),
-                        next_token_logprobs[b, lp_idx].unsqueeze(0),
-                        self.kl_type,
-                        self.mixed_kl_weight,
-                    ).squeeze(0)
-                    sample_terminal_losses[b] = terminal_eos_kl
-                    valid_terminal_sample_mask[b] = 1.0
+                    if self.kl_type == "is":
+                        assert prev_lps is not None
+                        if lp_idx >= prev_lps.shape[1]:
+                            continue
+                        raw_advantage = (teacher_terminal_eos[b] - prev_lps[b, lp_idx]).detach()
+                        terminal_ratio, terminal_clipped_ratio = _compute_is_ratio_terms(
+                            current_student_logprob=next_token_logprobs[b, lp_idx],
+                            old_student_logprob=prev_lps[b, lp_idx],
+                            clip_epsilon=self.clip_epsilon,
+                        )
+                        is_terminal_events.append((b, raw_advantage, terminal_ratio, terminal_clipped_ratio))
+                        is_raw_advantages.append(float(raw_advantage.item()))
+                    else:
+                        terminal_eos_kl = _compute_chunk_kl(
+                            teacher_terminal_eos[b].unsqueeze(0),
+                            next_token_logprobs[b, lp_idx].unsqueeze(0),
+                            self.kl_type,
+                            self.mixed_kl_weight,
+                        ).squeeze(0)
+                    if self.kl_type != "is":
+                        sample_terminal_losses[b] = terminal_eos_kl
+                        valid_terminal_sample_mask[b] = 1.0
 
-                num_valid_terminal_eos = int(valid_terminal_sample_mask.sum().item())
-                if num_valid_terminal_eos > 0:
-                    terminal_eos_loss = masked_mean(
-                        torch.stack(sample_terminal_losses),
-                        valid_terminal_sample_mask * sample_mask,
-                        global_normalization_factor=None,
-                    )
+        is_terminal_losses: list[float] = []
+        raw_adv_mean_value = 0.0
+        raw_adv_scale_value = 1.0
+        if self.kl_type == "is":
+            raw_advantage_tensors = [event[1] for event in is_chunk_events] + [event[1] for event in is_terminal_events]
+            normalized_advantages, raw_adv_mean, raw_adv_scale = _normalize_advantages(
+                raw_advantage_tensors,
+                self.advantage_normalization,
+            )
+            raw_adv_mean_value = float(raw_adv_mean.item())
+            raw_adv_scale_value = float(raw_adv_scale.item())
+
+            chunk_advantages = normalized_advantages[:len(is_chunk_events)]
+            terminal_advantages = normalized_advantages[len(is_chunk_events):]
+
+            for (sample_idx, _, ratio, clipped_ratio), advantage in zip(is_chunk_events, chunk_advantages):
+                chunk_loss = _compute_is_loss_from_advantage(
+                    advantage,
+                    ratio,
+                    clipped_ratio,
+                    negative_advantage_weight=self.negative_advantage_weight,
+                )
+                sample_chunk_losses[sample_idx] = sample_chunk_losses[sample_idx] + chunk_loss
+                sample_chunk_counts[sample_idx] += 1
+                is_advantages.append(float(advantage.item()))
+                is_ratios.append(float(ratio.item()))
+                is_clipped_ratios.append(float(clipped_ratio.item()))
+                is_chunk_losses.append(float(chunk_loss.item()))
+
+            for (sample_idx, _, ratio, clipped_ratio), advantage in zip(is_terminal_events, terminal_advantages):
+                terminal_eos_kl = _compute_is_loss_from_advantage(
+                    advantage,
+                    ratio,
+                    clipped_ratio,
+                    negative_advantage_weight=self.negative_advantage_weight,
+                )
+                sample_terminal_losses[sample_idx] = terminal_eos_kl
+                valid_terminal_sample_mask[sample_idx] = 1.0
+                is_advantages.append(float(advantage.item()))
+                is_ratios.append(float(ratio.item()))
+                is_clipped_ratios.append(float(clipped_ratio.item()))
+                is_terminal_losses.append(float(terminal_eos_kl.item()))
+
+            num_valid_terminal_eos = int(valid_terminal_sample_mask.sum().item())
+            if num_valid_terminal_eos > 0:
+                terminal_eos_loss = masked_mean(
+                    torch.stack(sample_terminal_losses),
+                    valid_terminal_sample_mask * sample_mask,
+                    global_normalization_factor=None,
+                )
+
+        # Average over chunks within each sample (not sum) so that loss
+        # does not scale with sequence length / number of chunks.
+        for b in range(batch_size):
+            if sample_chunk_counts[b] > 0:
+                sample_chunk_losses[b] = sample_chunk_losses[b] / sample_chunk_counts[b]
+
+        sample_chunk_loss_tensor = torch.stack(sample_chunk_losses)
+        valid_chunk_sample_mask = torch.tensor(
+            [count > 0 for count in sample_chunk_counts],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        if valid_chunk_sample_mask.sum() == 0:
+            trajectory_gap_loss = next_token_logprobs.sum() * 0.0
+            s_tok_counts = torch.zeros(0, dtype=torch.float32, device=device)
+            t_tok_counts = torch.zeros(0, dtype=torch.float32, device=device)
+        else:
+            s_tok_counts = torch.tensor(all_student_tok_counts, dtype=torch.float32, device=device)
+            t_tok_counts = torch.tensor(all_teacher_tok_counts, dtype=torch.float32, device=device)
+            trajectory_gap_loss = masked_mean(
+                sample_chunk_loss_tensor,
+                valid_chunk_sample_mask * sample_mask,
+                global_normalization_factor=None,
+            )
 
         # NLL anchor loss: standard next-token prediction loss on generated tokens
         # This prevents the student from drifting away from being a good language model
@@ -450,5 +593,23 @@ class CrossTokenizerTrainLossFn:
             "mean_teacher_pertok_lp": _t_lp_sum / max(_n_total_chunks, 1),
             "mean_student_pertok_lp": _s_lp_sum / max(_n_total_chunks, 1),
         }
+        if self.kl_type == "is":
+            metrics.update({
+                "is_mean_raw_advantage": sum(is_raw_advantages) / max(len(is_raw_advantages), 1),
+                "is_raw_pos_adv_frac": sum(1 for x in is_raw_advantages if x > 0) / max(len(is_raw_advantages), 1),
+                "is_mean_advantage": sum(is_advantages) / max(len(is_advantages), 1),
+                "is_pos_adv_frac": sum(1 for x in is_advantages if x > 0) / max(len(is_advantages), 1),
+                "is_advantage_center": raw_adv_mean_value,
+                "is_advantage_scale": raw_adv_scale_value,
+                "is_negative_advantage_weight": self.negative_advantage_weight,
+                "is_mean_ratio": sum(is_ratios) / max(len(is_ratios), 1),
+                "is_mean_clipped_ratio": sum(is_clipped_ratios) / max(len(is_clipped_ratios), 1),
+                "is_clip_frac": (
+                    sum(1 for r, cr in zip(is_ratios, is_clipped_ratios) if abs(r - cr) > 1e-6)
+                    / max(len(is_ratios), 1)
+                ),
+                "is_mean_chunk_loss": sum(is_chunk_losses) / max(len(is_chunk_losses), 1),
+                "is_mean_terminal_loss": sum(is_terminal_losses) / max(len(is_terminal_losses), 1),
+            })
 
         return loss, metrics

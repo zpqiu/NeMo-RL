@@ -26,8 +26,6 @@ mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 export PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/research/cross_tokenizer_distillation:${PYTHONPATH:-}
 export NRL_FORCE_REBUILD_VENVS=true
 
-MODEL_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
-
 cd $PROJECT_ROOT
 
 uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
@@ -36,7 +34,10 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     policy.model_name=$MODEL_DIR/google/gemma-3-4b-it \
     loss_fn.kl_type=is \
     loss_fn.clip_epsilon=0.2 \
-    policy.optimizer.kwargs.lr=5e-6 \
+    loss_fn.terminal_eos_weight=0.0 \
+    loss_fn.advantage_normalization=none \
+    loss_fn.negative_advantage_weight=0.25 \
+    policy.optimizer.kwargs.lr=1e-5 \
     teacher.model_name=$MODEL_DIR/Qwen/Qwen3-4B-Instruct-2507 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \

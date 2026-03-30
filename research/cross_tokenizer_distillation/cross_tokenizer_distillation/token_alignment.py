@@ -64,6 +64,16 @@ class AlignmentResult:
         return len(self.student_token_ids)
 
 
+def _empty_alignment_stats() -> dict[str, int]:
+    return {
+        "student_fast_path_hits": 0,
+        "student_fast_path_misses": 0,
+        "student_visible_piece_path_hits": 0,
+        "piece_greedy_hits": 0,
+        "piece_span_fallback_hits": 0,
+    }
+
+
 def _get_token_byte_spans(
     text: str,
     tokenizer,
@@ -163,6 +173,210 @@ def get_visible_pieces_from_original_ids(
     return visible_ids, pieces, original_indices
 
 
+def align_tokens_from_original_student_ids(
+    text: str,
+    teacher_tokenizer,
+    student_tokenizer,
+    original_student_token_ids: list[int],
+) -> AlignmentResult:
+    alignment, _ = align_tokens_from_original_student_ids_with_stats(
+        text=text,
+        teacher_tokenizer=teacher_tokenizer,
+        student_tokenizer=student_tokenizer,
+        original_student_token_ids=original_student_token_ids,
+    )
+    return alignment
+
+
+def align_tokens_from_original_student_ids_with_stats(
+    text: str,
+    teacher_tokenizer,
+    student_tokenizer,
+    original_student_token_ids: list[int],
+) -> tuple[AlignmentResult, dict[str, int]]:
+    """Align decoded text while preserving indices into the original student ids."""
+    stats = _empty_alignment_stats()
+    if not text or not original_student_token_ids:
+        return (
+            AlignmentResult(
+                text=text,
+                teacher_token_ids=[],
+                student_token_ids=list(original_student_token_ids),
+                chunks=[],
+            ),
+            stats,
+        )
+
+    special_ids = set(getattr(student_tokenizer, "all_special_ids", []) or [])
+    visible_original_ids = [
+        tid for tid in original_student_token_ids if tid not in special_ids
+    ]
+    visible_original_indices = [
+        i for i, tid in enumerate(original_student_token_ids) if tid not in special_ids
+    ]
+
+    # Fast path: if the visible text re-tokenizes to the same visible student ids
+    # (ignoring skipped special tokens), align directly from byte spans and remap
+    # chunk indices back to the original generated sequence.
+    try:
+        roundtrip_student_ids, roundtrip_student_spans = _get_token_byte_spans(
+            text, student_tokenizer
+        )
+        if roundtrip_student_ids == visible_original_ids:
+            teacher_ids, teacher_spans = _get_token_byte_spans(text, teacher_tokenizer)
+            alignment = _build_alignment_from_spans(
+                text=text,
+                teacher_ids=teacher_ids,
+                teacher_spans=teacher_spans,
+                student_ids=list(original_student_token_ids),
+                student_spans=roundtrip_student_spans,
+            )
+            for chunk in alignment.chunks:
+                chunk.student_token_indices = [
+                    visible_original_indices[idx] for idx in chunk.student_token_indices
+                ]
+            alignment.student_token_ids = list(original_student_token_ids)
+            stats["student_fast_path_hits"] += 1
+            return alignment, stats
+    except Exception:
+        pass
+    stats["student_fast_path_misses"] += 1
+
+    visible_ids, visible_pieces, original_indices = get_visible_pieces_from_original_ids(
+        student_tokenizer, original_student_token_ids
+    )
+    if not visible_ids:
+        return (
+            AlignmentResult(
+                text=text,
+                teacher_token_ids=[],
+                student_token_ids=list(original_student_token_ids),
+                chunks=[],
+            ),
+            stats,
+        )
+
+    alignment, piece_stats = align_tokens_by_decoded_pieces(
+        text,
+        teacher_tokenizer,
+        student_tokenizer,
+        student_token_ids=visible_ids,
+        student_pieces=visible_pieces,
+        return_stats=True,
+    )
+    stats["student_visible_piece_path_hits"] += 1
+    for key, value in piece_stats.items():
+        stats[key] = stats.get(key, 0) + value
+    for chunk in alignment.chunks:
+        chunk.student_token_indices = [
+            original_indices[idx] for idx in chunk.student_token_indices
+        ]
+    alignment.student_token_ids = list(original_student_token_ids)
+    return alignment, stats
+
+
+def _get_piece_byte_spans(pieces: list[bytes]) -> list[tuple[int, int]]:
+    """Convert sequential decoded pieces into byte spans over the shared text."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for piece in pieces:
+        next_cursor = cursor + len(piece)
+        spans.append((cursor, next_cursor))
+        cursor = next_cursor
+    return spans
+
+
+def _build_alignment_from_spans(
+    text: str,
+    teacher_ids: list[int],
+    teacher_spans: list[tuple[int, int]],
+    student_ids: list[int],
+    student_spans: list[tuple[int, int]],
+) -> AlignmentResult:
+    """Build alignment chunks from byte spans on both sides."""
+
+    teacher_end_map: dict[int, list[int]] = {}
+    for idx, (_, end) in enumerate(teacher_spans):
+        teacher_end_map.setdefault(end, []).append(idx)
+
+    student_end_map: dict[int, list[int]] = {}
+    for idx, (_, end) in enumerate(student_spans):
+        student_end_map.setdefault(end, []).append(idx)
+
+    all_boundaries = sorted(
+        set(
+            [s for s, _ in teacher_spans]
+            + [e for _, e in teacher_spans]
+            + [s for s, _ in student_spans]
+            + [e for _, e in student_spans]
+        )
+    )
+
+    chunks: list[AlignmentChunk] = []
+    chunk_start = all_boundaries[0] if all_boundaries else 0
+    pending_teacher: list[int] = []
+    pending_student: list[int] = []
+
+    for boundary in all_boundaries:
+        if boundary in teacher_end_map:
+            pending_teacher.extend(teacher_end_map[boundary])
+        if boundary in student_end_map:
+            pending_student.extend(student_end_map[boundary])
+
+        if pending_teacher and pending_student:
+            chunks.append(
+                AlignmentChunk(
+                    byte_start=chunk_start,
+                    byte_end=boundary,
+                    teacher_token_indices=sorted(pending_teacher),
+                    student_token_indices=sorted(pending_student),
+                )
+            )
+            chunk_start = boundary
+            pending_teacher = []
+            pending_student = []
+
+    if pending_teacher or pending_student:
+        if chunks:
+            last = chunks[-1]
+            last.byte_end = all_boundaries[-1] if all_boundaries else chunk_start
+            last.teacher_token_indices.extend(pending_teacher)
+            last.student_token_indices.extend(pending_student)
+        elif pending_teacher and pending_student:
+            chunks.append(
+                AlignmentChunk(
+                    byte_start=chunk_start,
+                    byte_end=all_boundaries[-1] if all_boundaries else chunk_start,
+                    teacher_token_indices=sorted(pending_teacher),
+                    student_token_indices=sorted(pending_student),
+                )
+            )
+
+    return AlignmentResult(
+        text=text,
+        teacher_token_ids=teacher_ids,
+        student_token_ids=student_ids,
+        chunks=chunks,
+    )
+
+
+def _align_from_piece_spans(
+    text: str,
+    teacher_ids: list[int],
+    teacher_pieces: list[bytes],
+    student_ids: list[int],
+    student_pieces: list[bytes],
+) -> AlignmentResult:
+    """Align two token-piece sequences using byte spans without re-tokenizing."""
+    return _build_alignment_from_spans(
+        text=text,
+        teacher_ids=teacher_ids,
+        teacher_spans=_get_piece_byte_spans(teacher_pieces),
+        student_ids=student_ids,
+        student_spans=_get_piece_byte_spans(student_pieces),
+    )
+
+
 def _get_token_ids_and_pieces(
     text: str,
     tokenizer,
@@ -195,6 +409,17 @@ def _get_token_ids_and_pieces(
     return token_ids, pieces
 
 
+def _get_token_ids_and_pieces_from_spans(
+    text: str,
+    tokenizer,
+) -> tuple[list[int], list[bytes]]:
+    """Tokenize text and recover per-token pieces directly from byte spans."""
+    token_ids, spans = _get_token_byte_spans(text, tokenizer)
+    text_bytes = text.encode("utf-8")
+    pieces = [text_bytes[start:end] for start, end in spans]
+    return token_ids, pieces
+
+
 def align_tokens_by_byte_offset(
     text: str,
     teacher_tokenizer,
@@ -214,76 +439,12 @@ def align_tokens_by_byte_offset(
     teacher_ids, teacher_spans = _get_token_byte_spans(text, teacher_tokenizer)
     student_ids, student_spans = _get_token_byte_spans(text, student_tokenizer)
 
-    # Build mapping: byte_boundary → set of token indices that END at that boundary.
-    # We use *end* boundaries because a chunk can only be closed when both sides
-    # have completed at least one token.
-    teacher_end_map: dict[int, list[int]] = {}
-    for idx, (_, end) in enumerate(teacher_spans):
-        teacher_end_map.setdefault(end, []).append(idx)
-
-    student_end_map: dict[int, list[int]] = {}
-    for idx, (_, end) in enumerate(student_spans):
-        student_end_map.setdefault(end, []).append(idx)
-
-    # Collect all byte boundaries and sort
-    all_boundaries = sorted(
-        set(
-            [s for s, _ in teacher_spans]
-            + [e for _, e in teacher_spans]
-            + [s for s, _ in student_spans]
-            + [e for _, e in student_spans]
-        )
-    )
-
-    # Greedy merge: walk boundaries, accumulate tokens, emit chunk when both
-    # sides have ≥1 token.
-    chunks: list[AlignmentChunk] = []
-    chunk_start = all_boundaries[0] if all_boundaries else 0
-    pending_teacher: list[int] = []
-    pending_student: list[int] = []
-
-    for boundary in all_boundaries:
-        if boundary in teacher_end_map:
-            pending_teacher.extend(teacher_end_map[boundary])
-        if boundary in student_end_map:
-            pending_student.extend(student_end_map[boundary])
-
-        # Emit a chunk when both sides have accumulated ≥1 token
-        if pending_teacher and pending_student:
-            chunks.append(
-                AlignmentChunk(
-                    byte_start=chunk_start,
-                    byte_end=boundary,
-                    teacher_token_indices=sorted(pending_teacher),
-                    student_token_indices=sorted(pending_student),
-                )
-            )
-            chunk_start = boundary
-            pending_teacher = []
-            pending_student = []
-
-    # Flush any remaining tokens into the last chunk
-    if pending_teacher or pending_student:
-        if chunks:
-            last = chunks[-1]
-            last.byte_end = all_boundaries[-1] if all_boundaries else chunk_start
-            last.teacher_token_indices.extend(pending_teacher)
-            last.student_token_indices.extend(pending_student)
-        elif pending_teacher and pending_student:
-            chunks.append(
-                AlignmentChunk(
-                    byte_start=chunk_start,
-                    byte_end=all_boundaries[-1] if all_boundaries else chunk_start,
-                    teacher_token_indices=sorted(pending_teacher),
-                    student_token_indices=sorted(pending_student),
-                )
-            )
-
-    return AlignmentResult(
+    return _build_alignment_from_spans(
         text=text,
-        teacher_token_ids=teacher_ids,
-        student_token_ids=student_ids,
-        chunks=chunks,
+        teacher_ids=teacher_ids,
+        teacher_spans=teacher_spans,
+        student_ids=student_ids,
+        student_spans=student_spans,
     )
 
 
@@ -293,7 +454,8 @@ def align_tokens_by_decoded_pieces(
     student_tokenizer,
     student_token_ids: list[int] | None = None,
     student_pieces: list[bytes] | None = None,
-) -> AlignmentResult:
+    return_stats: bool = False,
+) -> AlignmentResult | tuple[AlignmentResult, dict[str, int]]:
     """Align two tokenizations by greedily matching decoded token-piece groups.
 
     This follows the same spirit as GOLD: each side accumulates decoded token
@@ -305,7 +467,8 @@ def align_tokens_by_decoded_pieces(
     correctness: the indices in the returned chunks then reference positions in
     the **original** generated sequence rather than a re-encoded copy.
     """
-    teacher_ids, teacher_pieces = _get_token_ids_and_pieces(text, teacher_tokenizer)
+    stats = {"piece_greedy_hits": 0, "piece_span_fallback_hits": 0}
+    teacher_ids, teacher_pieces = _get_token_ids_and_pieces_from_spans(text, teacher_tokenizer)
     if student_token_ids is not None and student_pieces is not None:
         student_ids = student_token_ids
     else:
@@ -361,19 +524,27 @@ def align_tokens_by_decoded_pieces(
             )
         )
     elif teacher_buf or student_buf or teacher_group or student_group:
-        # Fall back to the more forgiving byte-offset alignment if the decoded
-        # pieces do not compose cleanly into the same visible text.
-        # NOTE: the byte-offset fallback always re-tokenizes both sides, so
-        # the caller must remap student indices afterwards if original ids
-        # were supplied.
-        return align_tokens_by_byte_offset(text, teacher_tokenizer, student_tokenizer)
+        # Greedy matching failed. Fall back to byte-span alignment over the
+        # already-decoded token pieces so we preserve the caller-provided
+        # student token index space.
+        stats["piece_span_fallback_hits"] += 1
+        alignment = _align_from_piece_spans(
+            text=text,
+            teacher_ids=teacher_ids,
+            teacher_pieces=teacher_pieces,
+            student_ids=student_ids,
+            student_pieces=student_pieces,
+        )
+        return (alignment, stats) if return_stats else alignment
 
-    return AlignmentResult(
+    stats["piece_greedy_hits"] += 1
+    alignment = AlignmentResult(
         text=text,
         teacher_token_ids=teacher_ids,
         student_token_ids=student_ids,
         chunks=chunks,
     )
+    return (alignment, stats) if return_stats else alignment
 
 
 def compute_chunk_logprobs(

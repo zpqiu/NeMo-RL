@@ -23,6 +23,8 @@ loss_fn:
   nll_anchor_weight: 0.0
   terminal_eos_weight: 1.0
   clip_epsilon: 0.2
+  advantage_normalization: "none"
+  negative_advantage_weight: 0.25
 
 checkpointing:
   enabled: true
