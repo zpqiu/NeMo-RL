@@ -11,7 +11,7 @@
 | **Partition** | `batch` |
 | **GPUs per Node** | 8 (H100) |
 | **Git Branch** | `research/cross-tokenizer-distill` |
-| **Local Project Root** | `/Users/qiuzhaopeng/Projs/RL-xopd` |
+| **Local Project Root** | `/Users/alexq/Projs/RL-xopd` |
 
 ### Models (on cluster)
 
@@ -57,10 +57,13 @@ ssh dfw "cd /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/al
   CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/nemo_rl.0228.sqsh \
   ACCOUNT=coreai_dlalgo_nemorl \
   PARTITION=batch \
+  MOUNTS=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq:/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq \
   bash tools/launch research/cross_tokenizer_distillation/tests/test_suites/llm/<SCRIPT_NAME>.sh" 2>&1
 ```
 
 Replace `<EXP_NAME>` with the experiment name (= script filename without `.sh`) and `<SCRIPT_NAME>` with the actual script file.
+
+> **Important:** The `MOUNTS` variable is required because the Pyxis container does not auto-mount Lustre user directories. Mount the user home directory (which contains model checkpoints, HF cache, etc.) so that scripts can access local model paths like `$MODEL_DIR/google/gemma-3-4b-it`.
 
 ### 4. Monitor job
 
@@ -69,19 +72,20 @@ Replace `<EXP_NAME>` with the experiment name (= script filename without `.sh`) 
 ssh dfw "squeue -u alexq -h -o '%i %j %T %M %S' --state=RUNNING,PENDING"
 
 # Watch training log (ray-driver.log is the main output)
-ssh dfw "tail -50 /lustre/fsw/.../RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log"
+ssh dfw "tail -50 /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log"
 
 # Grep key metrics
-ssh dfw "grep -E '(Loss \(chunk KL\)|Chunks:|Mean gen length|Step .* Results)' \
-  /lustre/fsw/.../RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log"
+ssh dfw "grep -E '(Loss \(total\)|Chunks:|Mean gen length|Step .* Results|Timing:)' \
+  /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log"
 
-# Check for errors
-ssh dfw "grep -i 'error\|Error\|traceback\|OOM' \
-  /lustre/fsw/.../RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log | tail -20"
+# Check for errors (filter out harmless warnings)
+ssh dfw "grep -i 'error\|traceback\|OOM' \
+  /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/RL-xopd/code_snapshots/<EXP_NAME>/<JOBID>-logs/ray-driver.log \
+  | grep -v 'UserWarning\|repeated\|error=' | tail -20"
 
 # Check slurm output (allocation-level logs)
-ssh dfw "ls /lustre/fsw/.../RL-xopd/code_snapshots/<EXP_NAME>/slurm-*.out"
-ssh dfw "tail -50 /lustre/fsw/.../RL-xopd/code_snapshots/<EXP_NAME>/slurm-*.out"
+ssh dfw "ls /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/RL-xopd/code_snapshots/<EXP_NAME>/slurm-*.out"
+ssh dfw "tail -50 /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/RL-xopd/code_snapshots/<EXP_NAME>/slurm-*.out"
 ```
 
 ### 5. Cancel job
@@ -107,6 +111,7 @@ ssh dfw "scancel <JOBID>"
 | `CONTAINER` | ✅ | Path to `.sqsh` container image |
 | `ACCOUNT` | ✅ | SLURM account |
 | `PARTITION` | ✅ | SLURM partition |
+| `MOUNTS` | ✅ | Extra bind mounts for the container (e.g., model directories). The container does **not** auto-mount Lustre user directories — you must explicitly mount any paths the experiment script references. |
 | `DRYRUN` | ❌ | `1` = print GPU hours only, `2` = create snapshot but don't submit |
 | `WATCH` | ❌ | Set to track job completion |
 
@@ -131,6 +136,9 @@ NUM_MINUTES=180
 # ===== END CONFIG =====
 
 set -eou pipefail
+
+# Local model directory — must be bind-mounted via MOUNTS when submitting
+MODEL_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
@@ -186,26 +194,48 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
 Training logs print per-step results:
 
 ```
-📊 Step 27 Results:
-  • Loss (chunk KL): 22.6259
-  • Chunks: 65397
-  • Mean gen length: 537.1
+📊 Step 1 Results:
+  • Loss (total): 0.0909
+  • Distill loss: 0.0909
+  • Chunk distill loss: 0.0909
+  • Terminal EOS loss: 0.0000
+  • NLL loss: 0.0000
+  • Chunks: 141318
+  • Mean gen length: 1159.7
+  • Teacher zero chunks: 23.3%  |  Student zero chunks: 35.4%
+  • Mean teacher per-tok lp: -0.6081  |  Mean student per-tok lp: -0.1677
+  • IS stats: raw_adv_mean=-0.4657  raw_pos_adv_frac=0.196  ...
+  • Alignment timing: total=31.84s  ...
 
-⏱️  Timing: 30.26s total
+⏱️  Timing: 147.48s total
 ```
 
 ### Key metrics to extract
 
 ```bash
-# Loss values
-grep "Loss (chunk KL):" ray-driver.log
+# Validation accuracy (primary metric, logged every val_period steps)
+grep "Accuracy:" ray-driver.log
+
+# Loss values (use "Loss (total)" — old "Loss (chunk KL)" is deprecated)
+grep "Loss (total):" ray-driver.log
+
+# All loss components
+grep -E "(Loss \(total\)|Distill loss|Terminal EOS loss|NLL loss):" ray-driver.log
 
 # Chunk counts (mode collapse indicator: should stay high, e.g. >10K)
 grep "Chunks:" ray-driver.log
 
 # Generation length (collapse indicator: should stay reasonable)
 grep "Mean gen length:" ray-driver.log
+
+# IS (importance sampling) stats — useful for IS-weighted KL
+grep "IS stats:" ray-driver.log
+
+# Step-level summary (training + validation)
+grep -E "(Step .* Results|Loss \(total\)|Chunks:|Mean gen length|Timing:|Validation Results|Accuracy:)" ray-driver.log
 ```
+
+> **Note:** Validation accuracy is the most important metric. It is logged to wandb/tensorboard as `validation/accuracy` and printed to console as `Accuracy: X.XXXX` inside the `📊 Validation Results:` block. It is computed every `val_period` steps (configured in the YAML, default 5 for `cross_distill_qwen3_to_gemma3.yaml`).
 
 ---
 
@@ -255,8 +285,10 @@ Following Karpathy's autoresearch methodology:
 
 | Issue | Fix |
 |-------|-----|
+| `HFValidationError: Repo id must be in the form 'repo_name'` | Container can't see local model path. Add `MOUNTS=<user_dir>:<user_dir>` when submitting. See Step 3. |
 | `transformers` version mismatch | Set `NRL_FORCE_REBUILD_VENVS=true` in script |
 | Mode collapse (chunks → 0) | Lower LR to `1e-6`, try `mixed` KL |
 | SSH timeout | Re-check `ssh -O check dfw` |
 | Old code running | Delete `code_snapshots/<EXP_NAME>/` before re-submitting |
 | `PYTHONPATH` missing | Ensure both project root AND `research/cross_tokenizer_distillation` are in PYTHONPATH |
+| `$MODEL_DIR` undefined in script | Add `MODEL_DIR=/lustre/fs1/.../models` before the first use of `$MODEL_DIR` |
