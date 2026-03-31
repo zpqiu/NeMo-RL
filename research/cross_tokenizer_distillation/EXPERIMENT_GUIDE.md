@@ -17,12 +17,8 @@
 
 | Model | Path |
 |-------|------|
-| Qwen3-4B-Base | `Qwen/Qwen3-4B-Base` (HuggingFace, auto-download) |
-| Qwen3-1.7B-Base | `/lustre/fs1/.../models/Qwen/Qwen3-1.7B-Base` |
-| Qwen3-0.6B-Base | `/lustre/fs1/.../models/Qwen/Qwen3-0.6B-Base` |
-| Qwen3-8B-Base | `/lustre/fs1/.../models/Qwen/Qwen3-8B-Base` |
-| Nemotron-9B-v2-Base | `/lustre/fs1/.../models/nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base` |
-| gpt-oss-20b | `/lustre/fs1/.../models/openai/gpt-oss-20b` |
+| Qwen3-4B-Instruct-2507 | `/lustre/fs1/.../models/Qwen/Qwen3-4B-Instruct-2507`|
+| Gemma3-4b-it | `/lustre/fs1/.../models/google/gemma-3-4b-it` |
 
 > Full models dir: `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/models/`
 
@@ -39,7 +35,8 @@ cross_tokenizer_distillation/token_alignment.py      # Byte-offset alignment
 cross_tokenizer_distillation/cross_tokenizer_loss.py  # Chunk-level KL loss
 cross_tokenizer_distillation/algorithm.py             # Training loop
 configs/cross_distill_math.yaml                       # Default config
-tests/test_suites/llm/cross-distill-smoke-1n8g.sh     # Experiment launch script
+configs/cross_distill_qwen3_to_gemma3.yaml            # Config for Qwen3-4B-Instruct-2507 -> Gemma3-4b-it
+tests/test_suites/llm/xdistill-qwen3-4b-to-gemma3-4b-1n8g.sh     # Experiment launch script
 ```
 
 ### 2. Commit & push
