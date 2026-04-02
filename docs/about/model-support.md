@@ -26,6 +26,6 @@ for model sizes under 70B at up to 32k sequence length.
 
 **VLMs**:
 
-- **Qwen**: Qwen3.5VL-35B-A3B/397B-A17B, Qwen2.5VL-3B
+- **Qwen**: Qwen3.5-35B-A3B/397B-A17B, Qwen2.5VL-3B
 
 In addition, please refer to our [performance page](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html) for benchmarks and full reproducible yaml recipe configs.
