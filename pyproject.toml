@@ -71,6 +71,8 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to same commit as Automodel dev group
+  "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514",
 ]
 vllm = [
   "cuda-python",
