@@ -6,7 +6,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     expert_model_parallel_size: 32
     expert_tensor_parallel_size: 1
     sequence_parallel: true
