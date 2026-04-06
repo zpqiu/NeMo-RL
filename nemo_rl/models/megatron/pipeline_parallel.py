@@ -60,8 +60,8 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     true_ranks = [rank for rank, flag in enumerate(obj_flags) if flag]
     if not true_ranks:
         raise ValueError("Object must exist on at least one PP rank")
-    if len(true_ranks) > 1:
-        raise ValueError(f"Object present on multiple PP ranks: {true_ranks}")
+    # When a parameter is shared across multiple PP stages (e.g. tied embeddings),
+    # use the first rank that has it as the broadcast source.
     src_rank = true_ranks[0]
 
     # ------------------------------------------------------------------
