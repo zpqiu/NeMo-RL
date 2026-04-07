@@ -21,9 +21,6 @@ cross_distillation:
     seed: 42
 
 loss_fn:
-  kl_type: "forward"
-  mixed_kl_weight: 0.5
-  nll_anchor_weight: 0.0
   terminal_eos_weight: 1.0
   advantage_normalization: "none"
   negative_advantage_weight: 0.25

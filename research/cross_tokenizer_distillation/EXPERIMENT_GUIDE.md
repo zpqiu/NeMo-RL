@@ -158,7 +158,6 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     cross_distillation.max_num_steps=$MAX_STEPS \
     cross_distillation.num_prompts_per_step=32 \
     cross_distillation.val_period=0 \
-    loss_fn.kl_type=mixed \
     policy.optimizer.kwargs.lr=1e-6 \
     policy.model_name=nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base \
     teacher.model_name=Qwen/Qwen3-4B-Base \
@@ -199,7 +198,6 @@ Training logs print per-step results:
   • Distill loss: 0.0909
   • Chunk distill loss: 0.0909
   • Terminal EOS loss: 0.0000
-  • NLL loss: 0.0000
   • Chunks: 141318
   • Mean gen length: 1159.7
   • Teacher zero chunks: 23.3%  |  Student zero chunks: 35.4%
@@ -220,7 +218,7 @@ grep "Accuracy:" ray-driver.log
 grep "Loss (total):" ray-driver.log
 
 # All loss components
-grep -E "(Loss \(total\)|Distill loss|Terminal EOS loss|NLL loss):" ray-driver.log
+grep -E "(Loss \(total\)|Distill loss|Terminal EOS loss):" ray-driver.log
 
 # Chunk counts (mode collapse indicator: should stay high, e.g. >10K)
 grep "Chunks:" ray-driver.log

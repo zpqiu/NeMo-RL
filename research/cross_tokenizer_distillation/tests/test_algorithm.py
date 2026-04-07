@@ -24,7 +24,6 @@ from cross_tokenizer_distillation.token_alignment import (
     compute_chunk_logprobs,
 )
 from cross_tokenizer_distillation.cross_tokenizer_loss import (
-    CrossTokenizerDistillationLossFn,
     CrossTokenizerTrainLossFn,
 )
 
@@ -142,55 +141,6 @@ class TestRetokenize:
 
 
 # ===========================================================================
-# Test: standalone loss (CrossTokenizerDistillationLossFn)
-# ===========================================================================
-
-class TestStandaloneLoss:
-    def test_full_pipeline(self):
-        """alignment → chunk logprobs → KL loss → backward."""
-        teacher_tok = MockWordTokenizer("teacher")
-        student_tok = MockCharTokenizer("student")
-
-        text = "hello world"
-        alignment = align_tokens_by_byte_offset(text, teacher_tok, student_tok)
-
-        n_teacher = alignment.num_teacher_tokens
-        n_student = alignment.num_student_tokens
-        teacher_lps = -torch.rand(n_teacher).abs() - 0.1
-        student_lps = (-torch.rand(n_student).abs() - 0.1).requires_grad_(True)
-
-        teacher_chunk_lps = compute_chunk_logprobs(teacher_lps, alignment.chunks, "teacher")
-        student_chunk_lps = compute_chunk_logprobs(student_lps, alignment.chunks, "student")
-
-        assert teacher_chunk_lps.shape[0] == alignment.num_chunks
-        assert student_chunk_lps.shape[0] == alignment.num_chunks
-
-        loss_fn = CrossTokenizerDistillationLossFn({"kl_type": "forward", "mixed_kl_weight": 0.5})
-        loss, metrics = loss_fn([teacher_chunk_lps], [student_chunk_lps])
-        loss.backward()
-        assert student_lps.grad is not None
-
-    def test_batch_pipeline(self):
-        teacher_tok = MockWordTokenizer("teacher")
-        student_tok = MockCharTokenizer("student")
-
-        texts = ["hello world", "foo bar baz"]
-        all_t, all_s = [], []
-
-        for text in texts:
-            alignment = align_tokens_by_byte_offset(text, teacher_tok, student_tok)
-            t_lps = -torch.rand(alignment.num_teacher_tokens).abs() - 0.1
-            s_lps = (-torch.rand(alignment.num_student_tokens).abs() - 0.1).requires_grad_(True)
-            all_t.append(compute_chunk_logprobs(t_lps, alignment.chunks, "teacher"))
-            all_s.append(compute_chunk_logprobs(s_lps, alignment.chunks, "student"))
-
-        loss_fn = CrossTokenizerDistillationLossFn({"kl_type": "reverse", "mixed_kl_weight": 0.5})
-        loss, metrics = loss_fn(all_t, all_s)
-        assert metrics["num_samples"] == 2
-        assert metrics["num_chunks"] > 0
-
-
-# ===========================================================================
 # Test: NeMo RL-compatible loss (CrossTokenizerTrainLossFn)
 # ===========================================================================
 
@@ -251,11 +201,14 @@ class TestTrainLoss:
         # Simulate next_token_logprobs from forward pass
         next_token_logprobs = (-torch.rand(1, total_seq_len - 1).abs() - 0.1).requires_grad_(True)
 
+        # prev_logprobs needed for IS loss
+        data["prev_logprobs"] = -torch.rand(1, total_seq_len - 1).abs() - 0.1
+
         return data, next_token_logprobs, n_chunks
 
     def test_train_loss_forward(self):
         data, next_token_logprobs, n_chunks = self._make_mock_data()
-        loss_fn = CrossTokenizerTrainLossFn({"kl_type": "forward", "mixed_kl_weight": 0.5})
+        loss_fn = CrossTokenizerTrainLossFn({"clip_epsilon": 0.2})
         loss, metrics = loss_fn(
             data=data,
             global_valid_seqs=torch.tensor(1),
@@ -267,7 +220,7 @@ class TestTrainLoss:
 
     def test_train_loss_backward(self):
         data, next_token_logprobs, _ = self._make_mock_data()
-        loss_fn = CrossTokenizerTrainLossFn({"kl_type": "forward", "mixed_kl_weight": 0.5})
+        loss_fn = CrossTokenizerTrainLossFn({"clip_epsilon": 0.2})
         loss, _ = loss_fn(
             data=data,
             global_valid_seqs=torch.tensor(1),
@@ -283,9 +236,7 @@ class TestTrainLoss:
         data["xalign_num_student_toks"].zero_()
         data["xalign_num_teacher_toks"].zero_()
 
-        loss_fn = CrossTokenizerTrainLossFn(
-            {"kl_type": "forward", "mixed_kl_weight": 0.5, "terminal_eos_weight": 1.0}
-        )
+        loss_fn = CrossTokenizerTrainLossFn({"terminal_eos_weight": 1.0, "clip_epsilon": 0.2})
         loss, metrics = loss_fn(
             data=data,
             global_valid_seqs=torch.tensor(1),
@@ -296,15 +247,3 @@ class TestTrainLoss:
         assert loss.requires_grad
         assert metrics["num_chunks"] == 0
         assert metrics["num_valid_terminal_eos"] == 1
-
-    def test_train_loss_all_kl_types(self):
-        for kl_type in ["forward", "reverse", "mixed"]:
-            data, next_token_logprobs, _ = self._make_mock_data()
-            loss_fn = CrossTokenizerTrainLossFn({"kl_type": kl_type, "mixed_kl_weight": 0.5})
-            loss, metrics = loss_fn(
-                data=data,
-                global_valid_seqs=torch.tensor(1),
-                global_valid_toks=torch.tensor(1),
-                next_token_logprobs=next_token_logprobs,
-            )
-            assert isinstance(loss.item(), float), f"Failed for {kl_type}"

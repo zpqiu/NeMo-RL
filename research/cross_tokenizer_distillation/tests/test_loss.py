@@ -12,162 +12,81 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for cross_tokenizer_loss module."""
+"""Tests for cross_tokenizer_loss module (IS-only)."""
 
 from __future__ import annotations
-
-import math
 
 import torch
 import pytest
 
 from cross_tokenizer_distillation.cross_tokenizer_loss import (
-    CrossTokenizerDistillationLossFn,
+    CrossTokenizerTrainLossFn,
     CrossTokenizerDistillationLossConfig,
-)
-from cross_tokenizer_distillation.token_alignment import (
-    AlignmentChunk,
-    compute_chunk_logprobs,
+    _compute_is_ratio_terms,
+    _compute_is_loss_from_advantage,
+    _normalize_advantages,
 )
 
 
-def _make_loss_fn(kl_type: str = "forward", mixed_weight: float = 0.5):
+def _make_loss_fn(**overrides):
     cfg: CrossTokenizerDistillationLossConfig = {
-        "kl_type": kl_type,
-        "mixed_kl_weight": mixed_weight,
+        "terminal_eos_weight": overrides.get("terminal_eos_weight", 1.0),
+        "clip_epsilon": overrides.get("clip_epsilon", 0.2),
+        "advantage_normalization": overrides.get("advantage_normalization", "center"),
+        "negative_advantage_weight": overrides.get("negative_advantage_weight", 1.0),
     }
-    return CrossTokenizerDistillationLossFn(cfg)
+    return CrossTokenizerTrainLossFn(cfg)
 
 
-class TestLossBasic:
-    """Step 7: basic loss function tests."""
+class TestISComponents:
+    """Test IS ratio and loss helper functions."""
 
-    def test_forward_kl_identical_distributions(self):
-        """When teacher == student, KL should be ~0."""
-        loss_fn = _make_loss_fn("forward")
-        lps = torch.tensor([-1.0, -2.0, -0.5])
-        loss, metrics = loss_fn([lps], [lps])
-        assert abs(loss.item()) < 1e-6
+    def test_ratio_no_change(self):
+        """When current == old, ratio should be 1."""
+        lp = torch.tensor(-1.0)
+        ratio, clipped = _compute_is_ratio_terms(lp, lp, clip_epsilon=0.2)
+        assert abs(ratio.item() - 1.0) < 1e-6
+        assert abs(clipped.item() - 1.0) < 1e-6
 
-    def test_reverse_kl_identical_distributions(self):
-        loss_fn = _make_loss_fn("reverse")
-        lps = torch.tensor([-1.0, -2.0, -0.5])
-        loss, metrics = loss_fn([lps], [lps])
-        assert abs(loss.item()) < 1e-6
+    def test_ratio_clipping(self):
+        """Large logprob change should be clipped."""
+        current = torch.tensor(-0.5)
+        old = torch.tensor(-2.0)
+        ratio, clipped = _compute_is_ratio_terms(current, old, clip_epsilon=0.2)
+        assert ratio.item() > 1.2  # unclipped > 1+eps
+        assert abs(clipped.item() - 1.2) < 1e-6  # clipped to 1+eps
 
-    def test_mixed_kl_identical_distributions(self):
-        loss_fn = _make_loss_fn("mixed")
-        lps = torch.tensor([-1.0, -2.0, -0.5])
-        loss, metrics = loss_fn([lps], [lps])
-        assert abs(loss.item()) < 1e-6
+    def test_loss_positive_advantage(self):
+        """Positive advantage with ratio=1 should give negative loss (reward)."""
+        adv = torch.tensor(1.0)
+        ratio = torch.tensor(1.0)
+        clipped = torch.tensor(1.0)
+        loss = _compute_is_loss_from_advantage(adv, ratio, clipped)
+        assert loss.item() < 0  # -advantage * ratio
 
-    def test_forward_kl_different_distributions(self):
-        loss_fn = _make_loss_fn("forward")
-        teacher_lps = torch.tensor([-0.5, -1.0])
-        student_lps = torch.tensor([-2.0, -3.0])
-        loss, metrics = loss_fn([teacher_lps], [student_lps])
-        # Student is worse than teacher → positive KL
-        assert loss.item() > 0
+    def test_loss_negative_advantage_weight(self):
+        """Negative advantage should be scaled by weight."""
+        adv = torch.tensor(-1.0)
+        ratio = torch.tensor(1.0)
+        clipped = torch.tensor(1.0)
+        loss_full = _compute_is_loss_from_advantage(adv, ratio, clipped, negative_advantage_weight=1.0)
+        loss_scaled = _compute_is_loss_from_advantage(adv, ratio, clipped, negative_advantage_weight=0.5)
+        assert abs(loss_scaled.item()) < abs(loss_full.item())
 
-    def test_reverse_kl_different_distributions(self):
-        loss_fn = _make_loss_fn("reverse")
-        teacher_lps = torch.tensor([-0.5, -1.0])
-        student_lps = torch.tensor([-2.0, -3.0])
-        loss, metrics = loss_fn([teacher_lps], [student_lps])
-        # reverse KL: student_p * (log student - log teacher) → negative * negative = positive? No.
-        # student_lps < teacher_lps → student_lps - teacher_lps < 0 → student_p * negative
-        # student_p > 0, so this is negative... but that's the KL value for mismatch direction
-        # Actually for reverse KL when student assigns LESS prob, KL is negative per chunk
-        # This is fine — we test it doesn't crash and returns a number
-        assert isinstance(loss.item(), float)
+    def test_normalize_center(self):
+        """Center normalization should produce zero mean."""
+        advs = [torch.tensor(1.0), torch.tensor(3.0), torch.tensor(5.0)]
+        normed, mean, scale = _normalize_advantages(advs, "center")
+        assert abs(mean.item() - 3.0) < 1e-6
+        assert abs(sum(a.item() for a in normed)) < 1e-5
 
-    def test_empty_batch(self):
-        loss_fn = _make_loss_fn("forward")
-        loss, metrics = loss_fn([], [])
-        assert loss.item() == 0.0
-        assert metrics["num_chunks"] == 0
+    def test_normalize_standardize(self):
+        """Standardize should produce zero mean and unit scale."""
+        advs = [torch.tensor(1.0), torch.tensor(3.0), torch.tensor(5.0)]
+        normed, mean, scale = _normalize_advantages(advs, "standardize")
+        assert abs(mean.item() - 3.0) < 1e-6
+        assert scale.item() > 0
 
-    def test_metrics_populated(self):
-        loss_fn = _make_loss_fn("forward")
-        t = torch.tensor([-1.0, -2.0])
-        s = torch.tensor([-1.5, -2.5])
-        loss, metrics = loss_fn([t], [s])
-        assert "loss" in metrics
-        assert "num_chunks" in metrics
-        assert "num_samples" in metrics
-        assert metrics["num_samples"] == 1
-        assert metrics["num_chunks"] == 2
-
-    def test_invalid_kl_type(self):
-        with pytest.raises(AssertionError):
-            _make_loss_fn("invalid")
-
-
-class TestLossWithAlignment:
-    """Step 8: loss integrated with alignment chunks."""
-
-    def test_alignment_to_chunk_logprobs_to_loss(self):
-        """Full pipeline: alignment → chunk logprobs → KL loss."""
-        # Simulate: teacher has 3 tokens, student has 4 tokens, aligned into 2 chunks
-        chunks = [
-            AlignmentChunk(byte_start=0, byte_end=5, teacher_token_indices=[0], student_token_indices=[0, 1]),
-            AlignmentChunk(byte_start=5, byte_end=11, teacher_token_indices=[1, 2], student_token_indices=[2, 3]),
-        ]
-        teacher_token_lps = torch.tensor([-0.5, -1.0, -0.8])
-        student_token_lps = torch.tensor([-0.6, -0.4, -1.2, -0.9])
-
-        teacher_chunk_lps = compute_chunk_logprobs(teacher_token_lps, chunks, "teacher")
-        student_chunk_lps = compute_chunk_logprobs(student_token_lps, chunks, "student")
-
-        assert teacher_chunk_lps.shape == (2,)
-        assert student_chunk_lps.shape == (2,)
-
-        loss_fn = _make_loss_fn("forward")
-        loss, metrics = loss_fn([teacher_chunk_lps], [student_chunk_lps])
-        assert isinstance(loss.item(), float)
-        assert metrics["num_chunks"] == 2
-
-    def test_multi_sample_batch(self):
-        """Multiple samples in one batch."""
-        chunks_1 = [
-            AlignmentChunk(byte_start=0, byte_end=3, teacher_token_indices=[0], student_token_indices=[0]),
-        ]
-        chunks_2 = [
-            AlignmentChunk(byte_start=0, byte_end=2, teacher_token_indices=[0], student_token_indices=[0]),
-            AlignmentChunk(byte_start=2, byte_end=5, teacher_token_indices=[1], student_token_indices=[1, 2]),
-        ]
-
-        t1 = compute_chunk_logprobs(torch.tensor([-1.0]), chunks_1, "teacher")
-        s1 = compute_chunk_logprobs(torch.tensor([-1.5]), chunks_1, "student")
-        t2 = compute_chunk_logprobs(torch.tensor([-0.5, -0.8]), chunks_2, "teacher")
-        s2 = compute_chunk_logprobs(torch.tensor([-0.6, -1.0, -0.7]), chunks_2, "student")
-
-        loss_fn = _make_loss_fn("forward")
-        loss, metrics = loss_fn([t1, t2], [s1, s2])
-        assert metrics["num_samples"] == 2
-        assert metrics["num_chunks"] == 3
-
-    def test_with_chunk_masks(self):
-        """Test masking specific chunks."""
-        t_lps = torch.tensor([-1.0, -2.0, -3.0])
-        s_lps = torch.tensor([-1.5, -1.5, -3.5])  # non-uniform differences
-        mask = torch.tensor([1.0, 0.0, 1.0])  # mask out chunk 1
-
-        loss_fn = _make_loss_fn("forward")
-        loss_masked, _ = loss_fn([t_lps], [s_lps], [mask])
-        loss_full, _ = loss_fn([t_lps], [s_lps])
-
-        # Masked loss should differ from full loss (chunk 1 is excluded)
-        assert loss_masked.item() != loss_full.item()
-
-    def test_gradient_flows(self):
-        """Ensure gradients flow through the loss to student logprobs."""
-        t_lps = torch.tensor([-1.0, -2.0], requires_grad=False)
-        s_lps = torch.tensor([-1.5, -2.5], requires_grad=True)
-
-        loss_fn = _make_loss_fn("forward")
-        loss, _ = loss_fn([t_lps], [s_lps])
-        loss.backward()
-
-        assert s_lps.grad is not None
-        assert s_lps.grad.shape == s_lps.shape
+    def test_normalize_empty(self):
+        normed, mean, scale = _normalize_advantages([], "center")
+        assert normed == []

@@ -34,7 +34,6 @@ uv run python research/cross_tokenizer_distillation/run_cross_distillation.py \
     --config research/cross_tokenizer_distillation/configs/cross_distill_qwen3_to_gemma3.yaml \
     cross_distillation.max_num_steps=$MAX_STEPS \
     policy.model_name=$MODEL_DIR/google/gemma-3-4b-it \
-    loss_fn.kl_type=is \
     loss_fn.clip_epsilon=0.2 \
     loss_fn.terminal_eos_weight=0.0 \
     loss_fn.advantage_normalization=none \

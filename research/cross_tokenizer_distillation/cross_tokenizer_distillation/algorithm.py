@@ -1242,28 +1242,25 @@ def cross_tokenizer_distillation_train(
                     )
 
                 # ---- 6.5) Compute student prev_logprobs for IS ----
-                prev_logprobs = None
-                if master_config["loss_fn"].get("kl_type") == "is":
-                    print("▶ Computing student prev_logprobs...", flush=True)
-                    with timer.time("student_logprob_inference"):
-                        teacher_policy.offload_after_refit()
-                        student_policy.prepare_for_lp_inference()
-                        logprob_data = BatchedDataDict({
-                            "input_ids": student_train_input_ids,
-                            "input_lengths": student_train_input_lengths,
-                            "token_mask": student_train_token_mask,
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        })
-                        logprob_data.to("cpu")
-                        prev_logprobs = student_policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
+                print("▶ Computing student prev_logprobs...", flush=True)
+                with timer.time("student_logprob_inference"):
+                    teacher_policy.offload_after_refit()
+                    student_policy.prepare_for_lp_inference()
+                    logprob_data = BatchedDataDict({
+                        "input_ids": student_train_input_ids,
+                        "input_lengths": student_train_input_lengths,
+                        "token_mask": student_train_token_mask,
+                        "sample_mask": repeated_batch["loss_multiplier"],
+                    })
+                    logprob_data.to("cpu")
+                    prev_logprobs = student_policy.get_logprobs(
+                        logprob_data, timer=timer
+                    )["logprobs"]
 
                 # ---- 7) Build student train_data and call Policy.train() ----
                 print("▶ Training student policy...", flush=True)
                 with timer.time("training_prep"):
-                    if prev_logprobs is None:
-                        teacher_policy.offload_after_refit()
+                    teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
@@ -1385,16 +1382,11 @@ def cross_tokenizer_distillation_train(
 
             train_loss = metrics.get("loss", float("nan"))
             distill_loss_raw = metrics.get("distill_loss", float("nan"))
-            nll_loss_raw = metrics.get("nll_loss", float("nan"))
             # Metrics from micro-batches may come as lists — take mean
             if isinstance(distill_loss_raw, list):
                 distill_loss = sum(distill_loss_raw) / max(len(distill_loss_raw), 1)
             else:
                 distill_loss = float(distill_loss_raw) if distill_loss_raw is not None else float("nan")
-            if isinstance(nll_loss_raw, list):
-                nll_loss = sum(nll_loss_raw) / max(len(nll_loss_raw), 1)
-            else:
-                nll_loss = float(nll_loss_raw) if nll_loss_raw is not None else float("nan")
             # Extract debug stats (may be lists from micro-batch aggregation)
             t_zero = _mean_metric_value(metrics.get("teacher_zero_pct", 0))
             s_zero = _mean_metric_value(metrics.get("student_zero_pct", 0))
@@ -1406,35 +1398,33 @@ def cross_tokenizer_distillation_train(
             print(f"  • Distill loss: {distill_loss:.4f}")
             print(f"  • Chunk distill loss: {_mean_metric_value(metrics.get('chunk_distill_loss', 0)):.4f}")
             print(f"  • Terminal EOS loss: {terminal_eos_loss:.4f}")
-            print(f"  • NLL loss: {nll_loss:.4f}")
             print(f"  • Chunks: {int(alignment_data['xalign_chunk_mask'].sum().item())}")
             print(f"  • Mean gen length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.1f}")
             print(f"  • Teacher zero chunks: {t_zero:.1f}%  |  Student zero chunks: {s_zero:.1f}%")
             print(f"  • Mean teacher per-tok lp: {t_mean_lp:.4f}  |  Mean student per-tok lp: {s_mean_lp:.4f}")
-            if master_config["loss_fn"].get("kl_type") == "is":
-                adv_norm_mode = master_config["loss_fn"].get("advantage_normalization", "center")
-                neg_adv_weight = master_config["loss_fn"].get("negative_advantage_weight", 1.0)
-                print(
-                    "  • IS stats:"
-                    f" raw_adv_mean={_mean_metric_value(metrics.get('is_mean_raw_advantage', 0)):.4f}"
-                    f"  raw_pos_adv_frac={_mean_metric_value(metrics.get('is_raw_pos_adv_frac', 0)):.3f}"
-                    f"  adv_mean={_mean_metric_value(metrics.get('is_mean_advantage', 0)):.4f}"
-                    f"  pos_adv_frac={_mean_metric_value(metrics.get('is_pos_adv_frac', 0)):.3f}"
-                    f"  ratio_mean={_mean_metric_value(metrics.get('is_mean_ratio', 0)):.4f}"
-                    f"  clip_frac={_mean_metric_value(metrics.get('is_clip_frac', 0)):.3f}"
-                )
-                print(
-                    "  • IS components:"
-                    f" chunk_mean={_mean_metric_value(metrics.get('is_mean_chunk_loss', 0)):.4f}"
-                    f"  terminal_mean={_mean_metric_value(metrics.get('is_mean_terminal_loss', 0)):.4f}"
-                )
-                print(
-                    "  • IS advantage norm:"
-                    f" mode={adv_norm_mode}"
-                    f"  neg_weight={neg_adv_weight:.2f}"
-                    f"  center={_mean_metric_value(metrics.get('is_advantage_center', 0)):.4f}"
-                    f"  scale={_mean_metric_value(metrics.get('is_advantage_scale', 1)):.4f}"
-                )
+            adv_norm_mode = master_config["loss_fn"].get("advantage_normalization", "center")
+            neg_adv_weight = master_config["loss_fn"].get("negative_advantage_weight", 1.0)
+            print(
+                "  • IS stats:"
+                f" raw_adv_mean={_mean_metric_value(metrics.get('is_mean_raw_advantage', 0)):.4f}"
+                f"  raw_pos_adv_frac={_mean_metric_value(metrics.get('is_raw_pos_adv_frac', 0)):.3f}"
+                f"  adv_mean={_mean_metric_value(metrics.get('is_mean_advantage', 0)):.4f}"
+                f"  pos_adv_frac={_mean_metric_value(metrics.get('is_pos_adv_frac', 0)):.3f}"
+                f"  ratio_mean={_mean_metric_value(metrics.get('is_mean_ratio', 0)):.4f}"
+                f"  clip_frac={_mean_metric_value(metrics.get('is_clip_frac', 0)):.3f}"
+            )
+            print(
+                "  • IS components:"
+                f" chunk_mean={_mean_metric_value(metrics.get('is_mean_chunk_loss', 0)):.4f}"
+                f"  terminal_mean={_mean_metric_value(metrics.get('is_mean_terminal_loss', 0)):.4f}"
+            )
+            print(
+                "  • IS advantage norm:"
+                f" mode={adv_norm_mode}"
+                f"  neg_weight={neg_adv_weight:.2f}"
+                f"  center={_mean_metric_value(metrics.get('is_advantage_center', 0)):.4f}"
+                f"  scale={_mean_metric_value(metrics.get('is_advantage_scale', 1)):.4f}"
+            )
             print(
                 "  • Alignment timing:"
                 f" total={alignment_total:.2f}s"
