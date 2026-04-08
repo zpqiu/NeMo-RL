@@ -315,10 +315,16 @@ class GoldTrainLossFn:
         """
         # Handle DTensor (tensor-parallel sharded logits): gather the full
         # vocab on each rank so we can index with global vocab IDs.
+        # With TP, the vocab dim is padded to be divisible by TP size.
+        # After gathering, truncate to the original vocab size.
         try:
             from torch.distributed.tensor import DTensor
             if isinstance(logits, DTensor):
                 logits = logits.full_tensor()
+                # Truncate TP padding on the vocab dimension
+                student_vocab = self.vocab_mapping.student_vocab_size
+                if logits.shape[-1] > student_vocab:
+                    logits = logits[..., :student_vocab]
         except ImportError:
             pass
 
