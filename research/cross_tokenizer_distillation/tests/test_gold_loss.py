@@ -199,8 +199,8 @@ class TestGoldTrainLossFn:
     @pytest.fixture
     def basic_setup(self):
         """Create a minimal GOLD loss fn with mock vocab mapping."""
-        # Small vocab: student has 5 tokens, teacher has 4 tokens
-        # Matched: tokens 0,1 on student side <-> 0,1 on teacher side
+        # Teacher has 4 tokens, student has 5 tokens
+        # Matched: teacher 0 <-> student 0, teacher 1 <-> student 1
         mapping = VocabMapping(
             matched_student_ids=[0, 1],
             matched_teacher_ids=[0, 1],
@@ -223,41 +223,48 @@ class TestGoldTrainLossFn:
         return loss_fn
 
     def _make_data(self, batch_size=2, seq_len=8, topk_k=4, n_groups=3):
-        """Create mock data dict for GOLD loss."""
+        """Create mock data dict for GOLD loss (DISTILLATION interface)."""
         data = {
-            "gold_teacher_topk_logits": torch.randn(batch_size, seq_len, topk_k),
-            "gold_teacher_topk_indices": torch.randint(0, 4, (batch_size, seq_len, topk_k)),
+            "teacher_topk_indices": torch.randint(0, 4, (batch_size, seq_len, topk_k)),
+            "gold_position_mask": torch.zeros(batch_size, seq_len),
             "gold_teacher_cond_factor": torch.zeros(batch_size, seq_len),
             "gold_student_cond_factor": torch.zeros(batch_size, seq_len),
-            "gold_group_student_pos": torch.zeros(batch_size, seq_len, dtype=torch.long),
-            "gold_group_mask": torch.zeros(batch_size, seq_len),
-            "gold_prompt_lengths": torch.tensor([2] * batch_size),
             "sample_mask": torch.ones(batch_size),
         }
-        # Set up n_groups valid groups per sample
+        # Set up n_groups valid positions per sample
         for b in range(batch_size):
             for g in range(min(n_groups, seq_len)):
-                data["gold_group_mask"][b, g] = 1.0
-                data["gold_group_student_pos"][b, g] = g
-                # Ensure teacher top-k indices include some matched tokens
-                data["gold_teacher_topk_indices"][b, g, 0] = 0  # matched
-                data["gold_teacher_topk_indices"][b, g, 1] = 1  # matched
-                data["gold_teacher_topk_indices"][b, g, 2] = 2  # unmatched
-                data["gold_teacher_topk_indices"][b, g, 3] = 3  # unmatched
+                data["gold_position_mask"][b, g] = 1.0
+                data["teacher_topk_indices"][b, g, 0] = 0  # matched
+                data["teacher_topk_indices"][b, g, 1] = 1  # matched
+                data["teacher_topk_indices"][b, g, 2] = 2  # unmatched
+                data["teacher_topk_indices"][b, g, 3] = 3  # unmatched
         return data
+
+    def _make_topk_logprobs(self, batch_size=2, seq_len=8, topk_k=4):
+        """Create mock student/teacher topk logprobs."""
+        # Random logprobs (negative values)
+        student = torch.randn(batch_size, seq_len, topk_k) - 2.0
+        teacher = torch.randn(batch_size, seq_len, topk_k) - 2.0
+        # Normalize to be valid log-softmax output (within top-k)
+        student = torch.log_softmax(student, dim=-1)
+        teacher = torch.log_softmax(teacher, dim=-1)
+        return student, teacher
 
     def test_forward_basic(self, basic_setup):
         """Loss should be finite and non-negative."""
         loss_fn = basic_setup
-        batch_size, seq_len, vocab_size = 2, 8, 5
-        logits = torch.randn(batch_size, seq_len, vocab_size, requires_grad=True)
-        data = self._make_data(batch_size=batch_size, seq_len=seq_len)
+        batch_size, seq_len, topk_k = 2, 8, 4
+        s_lp, t_lp = self._make_topk_logprobs(batch_size, seq_len, topk_k)
+        data = self._make_data(batch_size=batch_size, seq_len=seq_len, topk_k=topk_k)
 
         loss, metrics = loss_fn(
-            logits=logits,
+            student_topk_logprobs=s_lp,
+            teacher_topk_logprobs=t_lp,
+            H_all=None,
             data=data,
-            global_valid_seqs=torch.tensor(batch_size, dtype=torch.float32),
-            global_valid_toks=torch.tensor(batch_size * seq_len, dtype=torch.float32),
+            global_valid_seqs=torch.tensor(float(batch_size)),
+            global_valid_toks=torch.tensor(float(batch_size * seq_len)),
         )
 
         assert torch.isfinite(loss)
@@ -267,38 +274,33 @@ class TestGoldTrainLossFn:
         assert metrics["num_groups"] > 0
 
     def test_backward(self, basic_setup):
-        """Gradients should flow back through student logits."""
+        """Gradients should flow back through student logprobs."""
         loss_fn = basic_setup
-        batch_size, seq_len, vocab_size = 1, 8, 5
-        logits = torch.randn(batch_size, seq_len, vocab_size, requires_grad=True)
-        data = self._make_data(batch_size=batch_size, seq_len=seq_len, n_groups=2)
+        batch_size, seq_len, topk_k = 1, 8, 4
+        s_lp = torch.randn(batch_size, seq_len, topk_k, requires_grad=True)
+        t_lp = torch.log_softmax(torch.randn(batch_size, seq_len, topk_k), dim=-1)
+        data = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
 
         loss, _ = loss_fn(
-            logits=logits,
-            data=data,
-            global_valid_seqs=torch.tensor(1.0),
-            global_valid_toks=torch.tensor(8.0),
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
         loss.backward()
-        assert logits.grad is not None
-        # At least some gradients should be non-zero
-        assert not torch.all(logits.grad == 0)
+        assert s_lp.grad is not None
+        assert not torch.all(s_lp.grad == 0)
 
     def test_no_valid_groups(self, basic_setup):
         """When no groups are valid, loss should be 0."""
         loss_fn = basic_setup
-        batch_size, seq_len, vocab_size = 1, 8, 5
-        logits = torch.randn(batch_size, seq_len, vocab_size)
-        data = self._make_data(batch_size=batch_size, seq_len=seq_len, n_groups=0)
-        # All groups masked out
-        data["gold_group_mask"][:] = 0
+        batch_size, seq_len, topk_k = 1, 8, 4
+        s_lp, t_lp = self._make_topk_logprobs(1, seq_len, topk_k)
+        data = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=0)
+        data["gold_position_mask"][:] = 0
 
         loss, metrics = loss_fn(
-            logits=logits,
-            data=data,
-            global_valid_seqs=torch.tensor(1.0),
-            global_valid_toks=torch.tensor(8.0),
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
         assert loss.item() == 0.0
@@ -307,26 +309,23 @@ class TestGoldTrainLossFn:
     def test_cond_factors_affect_loss(self, basic_setup):
         """Non-zero conditional factors should change the loss."""
         loss_fn = basic_setup
-        batch_size, seq_len, vocab_size = 1, 8, 5
-        logits = torch.randn(batch_size, seq_len, vocab_size)
+        seq_len, topk_k = 8, 4
+        s_lp, t_lp = self._make_topk_logprobs(1, seq_len, topk_k)
 
-        # Loss with zero cond factors
-        data_zero = self._make_data(batch_size=1, seq_len=seq_len, n_groups=2)
+        data_zero = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
         loss_zero, _ = loss_fn(
-            logits=logits, data=data_zero,
-            global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            data=data_zero, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
-        # Loss with non-zero cond factors
-        data_nonzero = self._make_data(batch_size=1, seq_len=seq_len, n_groups=2)
+        data_nonzero = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
         data_nonzero["gold_teacher_cond_factor"][:, :2] = -0.5
         data_nonzero["gold_student_cond_factor"][:, :2] = -0.3
         loss_nonzero, _ = loss_fn(
-            logits=logits, data=data_nonzero,
-            global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            data=data_nonzero, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
-        # Losses should differ
         assert abs(loss_zero.item() - loss_nonzero.item()) > 1e-6
 
     def test_matched_weight_zero_disables_jsd(self, basic_setup):
@@ -340,12 +339,12 @@ class TestGoldTrainLossFn:
         }
         loss_fn = GoldTrainLossFn(cfg, mapping)
 
-        logits = torch.randn(1, 8, 5)
-        data = self._make_data(batch_size=1, seq_len=8, n_groups=2)
+        seq_len, topk_k = 8, 4
+        s_lp, t_lp = self._make_topk_logprobs(1, seq_len, topk_k)
+        data = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
         loss, metrics = loss_fn(
-            logits=logits, data=data,
-            global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
-        # Loss should only contain unmatched component
         assert torch.isfinite(loss)

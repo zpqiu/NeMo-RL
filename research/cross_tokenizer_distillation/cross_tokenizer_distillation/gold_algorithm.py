@@ -300,13 +300,14 @@ def pack_gold_alignment_into_data(
     seq_len: int,
     topk_k: int,
 ) -> dict[str, torch.Tensor]:
-    """Pack alignment + teacher top-k into tensors for GoldTrainLossFn.
+    """Pack alignment + teacher top-k into tensors indexed by student positions.
 
-    For each alignment group, extracts the teacher's top-k logits at the
-    group's first teacher token position, and computes conditional factors
-    for multi-token groups (sum of logprobs for subsequent tokens).
-
-    All tensors are padded to (B, seq_len) to pass nemo_rl validation.
+    The DISTILLATION loss path expects ``teacher_topk_logits`` and
+    ``teacher_topk_indices`` as ``[B, S_student, k]`` — one top-k per
+    student sequence position. For each student position that is the
+    first token of an alignment group, we fill in the teacher top-k from
+    the corresponding teacher position. Other positions get zeros and are
+    masked out by ``gold_position_mask``.
 
     Args:
         alignments: Per-sample alignment results.
@@ -323,14 +324,13 @@ def pack_gold_alignment_into_data(
         Dict of tensors to merge into train_data.
     """
     batch_size = len(alignments)
-    pad_dim = seq_len
 
-    gold_teacher_topk_logits = torch.zeros(batch_size, pad_dim, topk_k)
-    gold_teacher_topk_indices = torch.zeros(batch_size, pad_dim, topk_k, dtype=torch.long)
-    gold_teacher_cond_factor = torch.zeros(batch_size, pad_dim)
-    gold_student_cond_factor = torch.zeros(batch_size, pad_dim)
-    gold_group_student_pos = torch.zeros(batch_size, pad_dim, dtype=torch.long)
-    gold_group_mask = torch.zeros(batch_size, pad_dim)
+    # Tensors indexed by STUDENT sequence position
+    packed_teacher_topk_logits = torch.zeros(batch_size, seq_len, topk_k)
+    packed_teacher_topk_indices = torch.zeros(batch_size, seq_len, topk_k, dtype=torch.long)
+    gold_position_mask = torch.zeros(batch_size, seq_len)
+    gold_teacher_cond_factor = torch.zeros(batch_size, seq_len)
+    gold_student_cond_factor = torch.zeros(batch_size, seq_len)
 
     for b in range(batch_size):
         alignment = alignments[b]
@@ -339,58 +339,54 @@ def pack_gold_alignment_into_data(
 
         t_prompt_len = teacher_input_lengths[b]
         s_prompt_len = student_prompt_lengths[b]
-        t_gen_lps = teacher_gen_logprobs[b]  # logprobs for teacher generation tokens
+        t_gen_lps = teacher_gen_logprobs[b]
         t_topk_seq_len = teacher_topk_logits.shape[1]
 
-        for g, chunk in enumerate(alignment.chunks):
-            if g >= pad_dim:
-                break
-
-            # Teacher: first token position in the group (generation-relative)
-            if not chunk.teacher_token_indices:
+        for chunk in alignment.chunks:
+            if not chunk.teacher_token_indices or not chunk.student_token_indices:
                 continue
+
+            # Teacher: first token position (generation-relative)
             t_first_gen_pos = chunk.teacher_token_indices[0]
-            # Map to teacher sequence position (prompt + gen)
             t_seq_pos = t_prompt_len + t_first_gen_pos
             if t_seq_pos >= t_topk_seq_len:
                 continue
 
-            # Student: first token position in the group (generation-relative)
-            if not chunk.student_token_indices:
-                continue
+            # Student: first token position (generation-relative)
             s_first_gen_pos = chunk.student_token_indices[0]
+            # Map to student SEQUENCE position (prompt + gen)
+            s_seq_pos = s_prompt_len + s_first_gen_pos
+            if s_seq_pos >= seq_len:
+                continue
 
-            # Extract teacher top-k at this position
-            gold_teacher_topk_logits[b, g, :] = teacher_topk_logits[b, t_seq_pos, :]
-            gold_teacher_topk_indices[b, g, :] = teacher_topk_indices[b, t_seq_pos, :]
-            gold_group_student_pos[b, g] = s_first_gen_pos
-            gold_group_mask[b, g] = 1.0
+            # Place teacher top-k at the corresponding student position
+            packed_teacher_topk_logits[b, s_seq_pos, :] = teacher_topk_logits[b, t_seq_pos, :]
+            packed_teacher_topk_indices[b, s_seq_pos, :] = teacher_topk_indices[b, t_seq_pos, :]
+            gold_position_mask[b, s_seq_pos] = 1.0
 
-            # Teacher conditional factor: sum of logprobs for tokens 2..N in the group
+            # Teacher conditional factor
             if len(chunk.teacher_token_indices) > 1:
                 t_cond = 0.0
                 for t_idx in chunk.teacher_token_indices[1:]:
                     if t_idx < t_gen_lps.shape[0]:
                         t_cond += t_gen_lps[t_idx].item()
-                gold_teacher_cond_factor[b, g] = t_cond
+                gold_teacher_cond_factor[b, s_seq_pos] = t_cond
 
-            # Student conditional factor: sum of prev_logprobs for tokens 2..N
+            # Student conditional factor
             if len(chunk.student_token_indices) > 1:
                 s_cond = 0.0
                 for s_idx in chunk.student_token_indices[1:]:
-                    # Map generation-relative index to logprob index
                     lp_idx = s_prompt_len - 1 + s_idx
                     if 0 <= lp_idx < student_prev_logprobs.shape[1]:
                         s_cond += student_prev_logprobs[b, lp_idx].item()
-                gold_student_cond_factor[b, g] = s_cond
+                gold_student_cond_factor[b, s_seq_pos] = s_cond
 
     return {
-        "gold_teacher_topk_logits": gold_teacher_topk_logits,
-        "gold_teacher_topk_indices": gold_teacher_topk_indices,
+        "teacher_topk_logits": packed_teacher_topk_logits,       # standard key for DISTILLATION path
+        "teacher_topk_indices": packed_teacher_topk_indices,     # standard key for DISTILLATION path
+        "gold_position_mask": gold_position_mask,
         "gold_teacher_cond_factor": gold_teacher_cond_factor,
         "gold_student_cond_factor": gold_student_cond_factor,
-        "gold_group_student_pos": gold_group_student_pos,
-        "gold_group_mask": gold_group_mask,
     }
 
 
@@ -1044,14 +1040,13 @@ def gold_distillation_train(
                     "input_lengths": input_lengths,
                     "token_mask": student_token_mask,
                     "sample_mask": repeated_batch["loss_multiplier"],
-                    "gold_prompt_lengths": prompt_lengths_tensor,
-                    # GOLD alignment data
-                    "gold_teacher_topk_logits": alignment_data["gold_teacher_topk_logits"],
-                    "gold_teacher_topk_indices": alignment_data["gold_teacher_topk_indices"],
+                    # Standard keys for DISTILLATION path (per student position)
+                    "teacher_topk_logits": alignment_data["teacher_topk_logits"],
+                    "teacher_topk_indices": alignment_data["teacher_topk_indices"],
+                    # GOLD-specific alignment data
+                    "gold_position_mask": alignment_data["gold_position_mask"],
                     "gold_teacher_cond_factor": alignment_data["gold_teacher_cond_factor"],
                     "gold_student_cond_factor": alignment_data["gold_student_cond_factor"],
-                    "gold_group_student_pos": alignment_data["gold_group_student_pos"],
-                    "gold_group_mask": alignment_data["gold_group_mask"],
                 })
                 train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
@@ -1073,7 +1068,7 @@ def gold_distillation_train(
                         metrics[k] = v
                 metrics.update(rollout_metrics)
 
-                total_valid_tokens += int(alignment_data["gold_group_mask"].sum().item())
+                total_valid_tokens += int(alignment_data["gold_position_mask"].sum().item())
 
                 # Checkpointing
                 consumed_samples += distill_config["num_prompts_per_step"]

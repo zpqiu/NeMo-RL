@@ -256,20 +256,29 @@ class GoldLossConfig(TypedDict):
 class GoldTrainLossFn:
     """GOLD hybrid loss: JSD for matched vocab + sorted L1 for unmatched vocab.
 
-    Compatible with ``Policy.train()`` via ``LossInputType.LOGIT``.
+    Uses ``LossInputType.DISTILLATION`` to leverage nemo_rl's distributed
+    top-k logprob extraction (handles DTensor/TP without gathering full logits).
 
-    **Expected data dict keys** (all padded to (B, S)):
-    - ``gold_teacher_topk_logits``: (B, S, k) teacher top-k logits per alignment group
-    - ``gold_teacher_topk_indices``: (B, S, k) teacher top-k vocab indices per group
-    - ``gold_teacher_cond_factor``: (B, S) sum of teacher logprobs for multi-token groups
-    - ``gold_student_cond_factor``: (B, S) sum of student logprobs for multi-token groups
-    - ``gold_group_student_pos``: (B, S) student token position for each alignment group
-    - ``gold_group_mask``: (B, S) valid alignment group mask
-    - ``gold_prompt_lengths``: (B,) prompt lengths in student tokens
+    The framework extracts ``student_topk_logprobs`` at teacher's top-k indices
+    via ``get_distillation_topk_logprobs_from_logits``, which performs a
+    distributed log_softmax. The loss then splits the top-k into matched and
+    unmatched vocabulary tokens.
+
+    **Expected data dict keys**:
+    - ``teacher_topk_logits``: (B, S, k) teacher top-k logits at student positions
+    - ``teacher_topk_indices``: (B, S, k) teacher top-k global vocab indices
+    - ``gold_position_mask``: (B, S) valid alignment group mask (1 at positions
+      corresponding to the first student token of each group, 0 elsewhere)
+    - ``gold_teacher_cond_factor``: (B, S) teacher conditional factor per position
+    - ``gold_student_cond_factor``: (B, S) student conditional factor per position
     """
 
     loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.LOGIT
+    input_type = LossInputType.DISTILLATION
+
+    # Required by the DISTILLATION path in prepare_loss_input
+    zero_outside_topk = True
+    kl_type = "forward"
 
     def __init__(self, cfg: GoldLossConfig, vocab_mapping: VocabMapping):
         self.jsd_beta = cfg.get("jsd_beta", 0.0)
@@ -277,70 +286,59 @@ class GoldTrainLossFn:
         self.unmatched_weight = cfg.get("unmatched_weight", 1.0)
         self.temperature = cfg.get("temperature", 1.0)
         self.vocab_mapping = vocab_mapping
-
-        # Pre-compute index tensors for efficiency (will be moved to device on first call)
-        self._matched_student_ids_t = torch.tensor(
-            vocab_mapping.matched_student_ids, dtype=torch.long
-        )
-        self._matched_teacher_ids_t = torch.tensor(
-            vocab_mapping.matched_teacher_ids, dtype=torch.long
-        )
         self._device_initialized = False
 
     def _ensure_device(self, device: torch.device):
-        """Move pre-computed tensors to the correct device once."""
+        """Move vocab mapping tensors to the correct device once."""
         if not self._device_initialized:
-            self._matched_student_ids_t = self._matched_student_ids_t.to(device)
-            self._matched_teacher_ids_t = self._matched_teacher_ids_t.to(device)
+            self.vocab_mapping.teacher_matched_mask = self.vocab_mapping.teacher_matched_mask.to(device)
+            self.vocab_mapping.mapping_tensor = self.vocab_mapping.mapping_tensor.to(device)
             self._device_initialized = True
 
     def __call__(
         self,
-        logits: torch.Tensor,
+        student_topk_logprobs: torch.Tensor,
+        teacher_topk_logprobs: torch.Tensor,
+        H_all: torch.Tensor | None,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
-        **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute GOLD hybrid loss.
+        """Compute GOLD hybrid loss from top-k logprobs.
 
         Args:
-            logits: Student logits [B, S, V_student] from the training forward pass.
-            data: Data dict with alignment info and teacher top-k data.
+            student_topk_logprobs: [B, S-1, k] student log-probs at teacher's top-k indices.
+            teacher_topk_logprobs: [B, S-1, k] teacher log-probs at top-k indices.
+            H_all: Student entropy (unused, may be None).
+            data: Data dict with alignment masks and conditional factors.
             global_valid_seqs: Number of valid sequences for normalization.
             global_valid_toks: Number of valid tokens for normalization.
 
         Returns:
             (loss, metrics) tuple.
         """
-        # Handle DTensor (tensor-parallel sharded logits): gather the full
-        # vocab on each rank so we can index with global vocab IDs.
-        # With TP, the vocab dim is padded to be divisible by TP size.
-        # After gathering, truncate to the original vocab size.
-        try:
-            from torch.distributed.tensor import DTensor
-            if isinstance(logits, DTensor):
-                logits = logits.full_tensor()
-                # Truncate TP padding on the vocab dimension
-                student_vocab = self.vocab_mapping.student_vocab_size
-                if logits.shape[-1] > student_vocab:
-                    logits = logits[..., :student_vocab]
-        except ImportError:
-            pass
-
-        device = logits.device
+        device = student_topk_logprobs.device
         self._ensure_device(device)
 
-        batch_size = logits.shape[0]
+        batch_size = student_topk_logprobs.shape[0]
+        seq_len = student_topk_logprobs.shape[1]  # S-1
+        topk_k = student_topk_logprobs.shape[2]
 
         # Unpack data dict
-        teacher_topk_logits = data["gold_teacher_topk_logits"].to(device)  # (B, S, k)
-        teacher_topk_indices = data["gold_teacher_topk_indices"].to(device)  # (B, S, k)
+        teacher_topk_indices = data["teacher_topk_indices"].to(device)  # (B, S, k)
+        # Align to S-1 (the DISTILLATION path shifts by 1)
+        if teacher_topk_indices.shape[1] > seq_len:
+            teacher_topk_indices = teacher_topk_indices[:, :seq_len, :]
+
+        position_mask = data["gold_position_mask"].to(device)  # (B, S)
+        if position_mask.shape[1] > seq_len:
+            position_mask = position_mask[:, :seq_len]
         teacher_cond_factor = data["gold_teacher_cond_factor"].to(device)  # (B, S)
+        if teacher_cond_factor.shape[1] > seq_len:
+            teacher_cond_factor = teacher_cond_factor[:, :seq_len]
         student_cond_factor = data["gold_student_cond_factor"].to(device)  # (B, S)
-        group_student_pos = data["gold_group_student_pos"].to(device)  # (B, S)
-        group_mask = data["gold_group_mask"].to(device)  # (B, S)
-        prompt_lengths = data["gold_prompt_lengths"].to(device)  # (B,)
+        if student_cond_factor.shape[1] > seq_len:
+            student_cond_factor = student_cond_factor[:, :seq_len]
 
         sample_mask = data.get("sample_mask")
         if sample_mask is None:
@@ -348,82 +346,78 @@ class GoldTrainLossFn:
         else:
             sample_mask = sample_mask.to(device=device, dtype=torch.float32)
 
-        # Find max valid groups to limit iteration
-        max_valid = int(group_mask.sum(dim=1).max().item()) if group_mask.sum() > 0 else 0
+        # Convert logprobs to probs
+        student_topk_probs = student_topk_logprobs.exp()  # [B, S-1, k]
+        teacher_topk_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        # Per-sample loss accumulators
-        sample_matched_losses: list[torch.Tensor] = []
-        sample_unmatched_losses: list[torch.Tensor] = []
-        sample_group_counts: list[int] = []
-        valid_sample_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        # Apply conditional factors (multiply probs by scalar per position)
+        eps = 1e-8
+        s_cond_scale = torch.exp(student_cond_factor).clamp(min=eps).unsqueeze(-1)  # [B, S, 1]
+        t_cond_scale = torch.exp(teacher_cond_factor).clamp(min=eps).unsqueeze(-1)
+        student_topk_probs = student_topk_probs * s_cond_scale
+        teacher_topk_probs = teacher_topk_probs * t_cond_scale
 
-        # Debug accumulators
-        total_matched_loss = 0.0
-        total_unmatched_loss = 0.0
-        total_groups = 0
+        # Identify matched/unmatched in top-k indices
+        teacher_matched_mask_full = self.vocab_mapping.teacher_matched_mask  # [V_teacher]
+        max_idx = teacher_matched_mask_full.shape[0]
+        # Clamp indices to valid range
+        safe_indices = teacher_topk_indices.clamp(0, max_idx - 1)
+        topk_is_matched = teacher_matched_mask_full[safe_indices]  # [B, S-1, k] bool
 
-        for b in range(batch_size):
-            if sample_mask[b] == 0:
-                sample_matched_losses.append(logits.sum() * 0.0)
-                sample_unmatched_losses.append(logits.sum() * 0.0)
-                sample_group_counts.append(0)
-                continue
+        # ---- Matched tokens: JSD ----
+        # Compute per-position JSD over matched top-k tokens
+        matched_count = topk_is_matched.float()  # [B, S-1, k]
+        # Mask out unmatched tokens for JSD
+        s_matched = student_topk_probs * matched_count
+        t_matched = teacher_topk_probs * matched_count
+        # Renormalize within matched tokens per position
+        s_matched_sum = s_matched.sum(-1, keepdim=True).clamp(min=eps)
+        t_matched_sum = t_matched.sum(-1, keepdim=True).clamp(min=eps)
+        s_matched_norm = s_matched / s_matched_sum
+        t_matched_norm = t_matched / t_matched_sum
 
-            prompt_len = int(prompt_lengths[b].item())
-            b_matched_losses = []
-            b_unmatched_losses = []
+        s_log = torch.log(s_matched_norm.clamp(min=eps))
+        t_log = torch.log(t_matched_norm.clamp(min=eps))
 
-            for g in range(max_valid):
-                if group_mask[b, g] == 0:
-                    continue
+        # Generalized JSD per position
+        if self.jsd_beta == 0.0:
+            per_pos_jsd = F.kl_div(s_log, t_log, reduction="none", log_target=True)
+        elif self.jsd_beta == 1.0:
+            per_pos_jsd = F.kl_div(t_log, s_log, reduction="none", log_target=True)
+        else:
+            beta_t = torch.tensor(self.jsd_beta, dtype=s_log.dtype, device=device)
+            mixture = torch.logsumexp(
+                torch.stack([s_log + torch.log1p(-beta_t), t_log + torch.log(beta_t)]), dim=0
+            )
+            kl_t = F.kl_div(mixture, t_log, reduction="none", log_target=True)
+            kl_s = F.kl_div(mixture, s_log, reduction="none", log_target=True)
+            per_pos_jsd = beta_t * kl_t + (1.0 - beta_t) * kl_s
 
-                # Student logits at the group's representative position
-                s_pos = int(group_student_pos[b, g].item())
-                # Map generation-relative position to sequence position
-                logit_pos = prompt_len + s_pos
-                if logit_pos >= logits.shape[1]:
-                    continue
+        # Mask to matched tokens only and sum over vocab dim
+        per_pos_jsd = (per_pos_jsd * matched_count).sum(-1)  # [B, S-1]
+        # Mask to valid alignment positions
+        matched_loss = per_pos_jsd * position_mask  # [B, S-1]
 
-                student_logits_at_pos = logits[b, logit_pos, :]  # [V_student]
+        # ---- Unmatched tokens: sorted L1 ----
+        unmatched_count = (~topk_is_matched).float()
+        s_unmatched = student_topk_probs * unmatched_count
+        t_unmatched = teacher_topk_probs * unmatched_count
 
-                # Teacher top-k at this group
-                t_topk_logits = teacher_topk_logits[b, g, :]  # [k]
-                t_topk_indices = teacher_topk_indices[b, g, :]  # [k]
+        # Sort unmatched probs per position and compute L1
+        s_unsorted = s_unmatched.sort(dim=-1, descending=True).values
+        t_unsorted = t_unmatched.sort(dim=-1, descending=True).values
+        per_pos_l1 = (s_unsorted - t_unsorted).abs().sum(-1)  # [B, S-1]
+        unmatched_loss = per_pos_l1 * position_mask  # [B, S-1]
 
-                # Conditional factors for multi-token groups
-                s_cond = student_cond_factor[b, g]  # scalar logprob sum
-                t_cond = teacher_cond_factor[b, g]  # scalar logprob sum
+        # ---- Combine ----
+        per_pos_loss = self.matched_weight * matched_loss + self.unmatched_weight * unmatched_loss
+        # Average over valid positions per sample
+        n_valid_per_sample = position_mask.sum(-1).clamp(min=1)  # [B]
+        per_sample_loss = per_pos_loss.sum(-1) / n_valid_per_sample  # [B]
 
-                matched_loss, unmatched_loss = self._compute_group_loss(
-                    student_logits_at_pos=student_logits_at_pos,
-                    teacher_topk_logits=t_topk_logits,
-                    teacher_topk_indices=t_topk_indices,
-                    student_cond_factor=s_cond,
-                    teacher_cond_factor=t_cond,
-                )
-
-                b_matched_losses.append(matched_loss)
-                b_unmatched_losses.append(unmatched_loss)
-
-            n_groups = len(b_matched_losses)
-            if n_groups > 0:
-                b_matched = torch.stack(b_matched_losses).mean()
-                b_unmatched = torch.stack(b_unmatched_losses).mean()
-                valid_sample_mask[b] = 1.0
-                total_matched_loss += b_matched.item()
-                total_unmatched_loss += b_unmatched.item()
-                total_groups += n_groups
-            else:
-                b_matched = logits.sum() * 0.0
-                b_unmatched = logits.sum() * 0.0
-
-            sample_matched_losses.append(b_matched)
-            sample_unmatched_losses.append(b_unmatched)
-            sample_group_counts.append(n_groups)
-
-        # Combine losses
+        valid_sample_mask = (n_valid_per_sample > 0).float() * sample_mask
         if valid_sample_mask.sum() == 0:
-            loss = logits.sum() * 0.0
+            loss = student_topk_logprobs.sum() * 0.0
             return loss, {
                 "loss": 0.0,
                 "matched_jsd_loss": 0.0,
@@ -432,19 +426,21 @@ class GoldTrainLossFn:
                 "num_valid_samples": 0,
             }
 
-        matched_loss_tensor = torch.stack(sample_matched_losses)
-        unmatched_loss_tensor = torch.stack(sample_unmatched_losses)
-        combined = (
-            self.matched_weight * matched_loss_tensor
-            + self.unmatched_weight * unmatched_loss_tensor
-        )
-        loss = masked_mean(combined, valid_sample_mask * sample_mask, global_normalization_factor=None)
+        loss = masked_mean(per_sample_loss, valid_sample_mask, global_normalization_factor=None)
 
         n_valid = int(valid_sample_mask.sum().item())
+        total_groups = int(position_mask.sum().item())
+        avg_matched = masked_mean(
+            matched_loss.sum(-1) / n_valid_per_sample, valid_sample_mask, global_normalization_factor=None
+        ).item()
+        avg_unmatched = masked_mean(
+            unmatched_loss.sum(-1) / n_valid_per_sample, valid_sample_mask, global_normalization_factor=None
+        ).item()
+
         metrics = {
             "loss": loss.item(),
-            "matched_jsd_loss": total_matched_loss / max(n_valid, 1),
-            "unmatched_l1_loss": total_unmatched_loss / max(n_valid, 1),
+            "matched_jsd_loss": avg_matched,
+            "unmatched_l1_loss": avg_unmatched,
             "num_groups": total_groups,
             "num_valid_samples": n_valid,
             "mean_groups_per_sample": total_groups / max(n_valid, 1),
@@ -452,112 +448,3 @@ class GoldTrainLossFn:
         }
 
         return loss, metrics
-
-    def _compute_group_loss(
-        self,
-        student_logits_at_pos: torch.Tensor,
-        teacher_topk_logits: torch.Tensor,
-        teacher_topk_indices: torch.Tensor,
-        student_cond_factor: torch.Tensor,
-        teacher_cond_factor: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute GOLD loss for a single alignment group.
-
-        Args:
-            student_logits_at_pos: [V_student] student logits at the group's position
-            teacher_topk_logits: [k] teacher top-k logits at the group's position
-            teacher_topk_indices: [k] teacher top-k global vocab indices
-            student_cond_factor: scalar, sum of student logprobs for tokens 2..N in group
-            teacher_cond_factor: scalar, sum of teacher logprobs for tokens 2..N in group
-
-        Returns:
-            (matched_jsd_loss, unmatched_l1_loss) tuple.
-        """
-        device = student_logits_at_pos.device
-        eps = 1e-8
-
-        # --- Student probabilities (full distribution) ---
-        student_log_probs = F.log_softmax(student_logits_at_pos / self.temperature, dim=-1)
-        student_probs = student_log_probs.exp()
-
-        # --- Teacher probabilities (from top-k) ---
-        # Apply temperature and compute softmax over top-k
-        teacher_topk_probs = F.softmax(teacher_topk_logits / self.temperature, dim=-1)
-        # Note: teacher_topk_probs sums to ~1 over the top-k tokens only.
-        # For tokens outside top-k, we assume negligible probability.
-
-        # --- Apply conditional factors for multi-token groups ---
-        # These scale the entire distribution by the product of conditional probs
-        # for subsequent tokens in the group (chain rule).
-        s_cond_scale = torch.exp(student_cond_factor).clamp(min=eps)
-        t_cond_scale = torch.exp(teacher_cond_factor).clamp(min=eps)
-
-        # Scale student probs (full distribution scaled by scalar)
-        student_probs_scaled = student_probs * s_cond_scale
-
-        # Scale teacher top-k probs
-        teacher_topk_probs_scaled = teacher_topk_probs * t_cond_scale
-
-        # --- Split into matched / unmatched ---
-
-        # Find which teacher top-k tokens are matched
-        # For each top-k index, check if it's in matched_teacher_ids
-        teacher_matched_mask = self.vocab_mapping.teacher_matched_mask.to(device)
-        topk_is_matched = teacher_matched_mask[teacher_topk_indices]  # [k] bool
-
-        # 1) Matched tokens: JSD loss
-        matched_loss = student_logits_at_pos.sum() * 0.0  # zero with grad
-        if topk_is_matched.any() and self.vocab_mapping.num_matched > 0:
-            # Extract matched teacher probs and their corresponding student probs
-            matched_teacher_topk_idx = topk_is_matched.nonzero(as_tuple=True)[0]
-            matched_teacher_global_ids = teacher_topk_indices[matched_teacher_topk_idx]
-            matched_teacher_probs = teacher_topk_probs_scaled[matched_teacher_topk_idx]
-
-            # Map teacher IDs to student IDs via the mapping tensor
-            mapping = self.vocab_mapping.mapping_tensor.to(device)
-            # Clamp indices to valid range for the mapping tensor
-            safe_indices = matched_teacher_global_ids.clamp(max=mapping.shape[0] - 1)
-            matched_student_global_ids = mapping[safe_indices]
-
-            # Filter out any that failed to map (shouldn't happen but be safe)
-            valid = matched_student_global_ids >= 0
-            if valid.any():
-                matched_student_global_ids = matched_student_global_ids[valid]
-                matched_teacher_probs = matched_teacher_probs[valid]
-
-                matched_student_probs = student_probs_scaled[matched_student_global_ids]
-
-                # Renormalize for JSD computation (the matched subset doesn't sum to 1)
-                s_matched_sum = matched_student_probs.sum().clamp(min=eps)
-                t_matched_sum = matched_teacher_probs.sum().clamp(min=eps)
-                s_matched_normalized = matched_student_probs / s_matched_sum
-                t_matched_normalized = matched_teacher_probs / t_matched_sum
-
-                s_log = torch.log(s_matched_normalized.clamp(min=eps))
-                t_log = torch.log(t_matched_normalized.clamp(min=eps))
-
-                # JSD over matched vocab (unsqueeze to add position dim)
-                matched_loss = generalized_jsd_loss(
-                    s_log.unsqueeze(0),
-                    t_log.unsqueeze(0),
-                    beta=self.jsd_beta,
-                )
-
-        # 2) Unmatched tokens: sorted L1 loss
-        unmatched_loss = student_logits_at_pos.sum() * 0.0  # zero with grad
-
-        # Student unmatched: all tokens NOT in matched set
-        student_matched_mask = self.vocab_mapping.student_matched_mask.to(device)
-        student_unmatched_mask = ~student_matched_mask
-        student_unmatched_probs = student_probs_scaled[student_unmatched_mask]
-
-        # Teacher unmatched: top-k tokens NOT in matched set
-        teacher_unmatched_probs = teacher_topk_probs_scaled[~topk_is_matched]
-
-        if student_unmatched_probs.numel() > 0 and teacher_unmatched_probs.numel() > 0:
-            unmatched_loss = sorted_l1_loss(
-                student_unmatched_probs.unsqueeze(0),
-                teacher_unmatched_probs.unsqueeze(0),
-            )
-
-        return matched_loss, unmatched_loss
