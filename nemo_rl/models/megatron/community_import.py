@@ -20,6 +20,38 @@ from megatron.bridge import AutoBridge
 from nemo_rl.models.policy import MegatronConfig
 
 
+def _patch_vl_tp_validation():
+    """Relax TP validation for Qwen3.5 VL providers to allow TP > num_query_groups.
+
+    Megatron-LM core already supports num_query_groups < TP via all-gather + slicing
+    in the attention forward pass, but the VL providers have an overly conservative
+    check that blocks this. We relax it to match Megatron-LM's TransformerConfig
+    validation: num_query_groups must be a multiple or divisor of TP size.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl import qwen35_vl_provider
+
+        def _relaxed_validate_parallelism(self):
+            if (
+                self.num_query_groups % self.tensor_model_parallel_size != 0
+                and self.tensor_model_parallel_size % self.num_query_groups != 0
+            ):
+                raise ValueError(
+                    f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+                )
+
+        for cls_name in ("Qwen35VLDenseModelProvider", "Qwen35VLMoEModelProvider"):
+            cls = getattr(qwen35_vl_provider, cls_name, None)
+            if cls is not None and hasattr(cls, "validate_parallelism"):
+                cls.validate_parallelism = _relaxed_validate_parallelism
+    except ImportError:
+        pass
+
+
+_patch_vl_tp_validation()
+
+
 def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
