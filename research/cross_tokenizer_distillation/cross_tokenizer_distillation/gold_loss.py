@@ -313,6 +313,15 @@ class GoldTrainLossFn:
         Returns:
             (loss, metrics) tuple.
         """
+        # Handle DTensor (tensor-parallel sharded logits): gather the full
+        # vocab on each rank so we can index with global vocab IDs.
+        try:
+            from torch.distributed.tensor import DTensor
+            if isinstance(logits, DTensor):
+                logits = logits.full_tensor()
+        except ImportError:
+            pass
+
         device = logits.device
         self._ensure_device(device)
 
