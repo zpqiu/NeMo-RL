@@ -33,7 +33,7 @@ cd $PROJECT_ROOT
 uv run python research/cross_tokenizer_distillation/run_gold.py \
     --config research/cross_tokenizer_distillation/configs/gold_math.yaml \
     gold_distillation.max_num_steps=$MAX_STEPS \
-    policy.model_name=$MODEL_DIR/google/gemma-3-4b-it \
+    policy.model_name=$MODEL_DIR/meta-llama/Llama-3.2-1B-Instruct \
     teacher.model_name=$MODEL_DIR/Qwen/Qwen3-4B-Instruct-2507 \
     loss_fn.jsd_beta=0.0 \
     loss_fn.matched_weight=1.0 \
@@ -51,7 +51,7 @@ uv run python research/cross_tokenizer_distillation/run_gold.py \
 
 echo ""
 echo "============================================"
-echo "  GOLD Distillation: Qwen3-4B -> Gemma-3-4B"
+echo "  GOLD Distillation: Qwen3-4B -> Llama-3.2-1B"
 echo "  Algorithm: JSD (matched) + Sorted L1 (unmatched)"
 echo "============================================"
 

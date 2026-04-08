@@ -1,6 +1,6 @@
 # GOLD (General On-Policy Logit Distillation) Configuration
 # Teacher: Qwen/Qwen3-4B-Instruct-2507 (Qwen3 tokenizer)
-# Student: google/gemma-3-4b-it (Gemma tokenizer)
+# Student: meta-llama/Llama-3.2-1B-Instruct (Llama tokenizer)
 #
 # GOLD uses a hybrid loss:
 # - JSD for matched vocabulary tokens (tokens with identical strings in both vocabs)
@@ -29,7 +29,7 @@ loss_fn:
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "checkpoints/gold-qwen3-4b-to-gemma3-4b"
+    checkpoint_dir: "checkpoints/gold-qwen3-4b-to-llama3.2-1b"
     metric_name: null
     higher_is_better: true
     keep_top_k: 3
@@ -39,7 +39,7 @@ checkpointing:
     save_consolidated: false
 
 policy: &STUDENT_BASE
-    model_name: "google/gemma-3-4b-it"
+    model_name: "meta-llama/Llama-3.2-1B-Instruct"
     tokenizer:
         name: ${..model_name}
         chat_template: null
@@ -165,7 +165,7 @@ env:
         num_workers: 4
 
 logger:
-    log_dir: "logs/gold-qwen3-4b-to-gemma3-4b"
+    log_dir: "logs/gold-qwen3-4b-to-llama3.2-1b"
     num_val_samples_to_print: 3
     wandb_enabled: false
     tensorboard_enabled: true
@@ -174,9 +174,9 @@ logger:
     monitor_gpus: true
     wandb:
         project: "nemo-gold-distillation"
-        name: "gold-qwen3-4b-to-gemma3-4b"
+        name: "gold-qwen3-4b-to-llama3.2-1b"
     tensorboard:
-        log_dir: "tb_logs-gold-qwen3-4b-to-gemma3-4b"
+        log_dir: "tb_logs-gold-qwen3-4b-to-llama3.2-1b"
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10
