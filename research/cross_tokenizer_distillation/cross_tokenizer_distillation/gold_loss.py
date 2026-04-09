@@ -628,8 +628,10 @@ class GoldTrainLossFn:
         matched_count = topk_is_matched.float()
         s_matched = student_topk_probs * matched_count
         t_matched = teacher_topk_probs * matched_count
-        s_log = torch.log(s_matched.clamp(min=eps))
-        t_log = torch.log(t_matched.clamp(min=eps))
+        s_matched_sum = s_matched.sum(-1, keepdim=True).clamp(min=eps)
+        t_matched_sum = t_matched.sum(-1, keepdim=True).clamp(min=eps)
+        s_log = torch.log((s_matched / s_matched_sum).clamp(min=eps))
+        t_log = torch.log((t_matched / t_matched_sum).clamp(min=eps))
 
         if self.jsd_beta == 0.0:
             per_pos_jsd = F.kl_div(s_log, t_log, reduction="none", log_target=True)
@@ -646,7 +648,12 @@ class GoldTrainLossFn:
 
         per_pos_jsd = (per_pos_jsd * matched_count).sum(-1)
         matched_present = (matched_count.sum(-1) > 0).float()
-        matched_loss = per_pos_jsd * position_mask * matched_present
+        # In this top-k approximation we only observe a truncated matched subset,
+        # so using unnormalized chunk masses directly in KL is unstable. Keep the
+        # JSD on normalized matched distributions and inject chunk-probability
+        # information as a symmetric per-position weight.
+        matched_weight_scale = torch.exp(0.5 * (student_cond_factor + teacher_cond_factor)).clamp(min=eps)
+        matched_loss = per_pos_jsd * position_mask * matched_present * matched_weight_scale
 
         # ---- Unmatched tokens: sorted L1 ----
         unmatched_count = (~topk_is_matched).float()
