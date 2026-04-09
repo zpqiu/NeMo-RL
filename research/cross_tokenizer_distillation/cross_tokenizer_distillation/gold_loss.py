@@ -325,10 +325,13 @@ class GoldTrainLossFn:
         topk_k = student_topk_logprobs.shape[2]
 
         # Unpack data dict
-        teacher_topk_indices = data["teacher_topk_indices"].to(device)  # (B, S, k)
+        # Use ORIGINAL teacher indices for matched/unmatched classification
+        # (the "teacher_topk_indices" key has been remapped to student vocab
+        # for the DISTILLATION gather path, so use the original for classification)
+        teacher_topk_indices_orig = data["gold_teacher_topk_indices_original"].to(device)  # (B, S, k)
         # Align to S-1 (the DISTILLATION path shifts by 1)
-        if teacher_topk_indices.shape[1] > seq_len:
-            teacher_topk_indices = teacher_topk_indices[:, :seq_len, :]
+        if teacher_topk_indices_orig.shape[1] > seq_len:
+            teacher_topk_indices_orig = teacher_topk_indices_orig[:, :seq_len, :]
 
         position_mask = data["gold_position_mask"].to(device)  # (B, S)
         if position_mask.shape[1] > seq_len:
@@ -346,6 +349,16 @@ class GoldTrainLossFn:
         else:
             sample_mask = sample_mask.to(device=device, dtype=torch.float32)
 
+        # Apply temperature scaling to logprobs before converting to probs.
+        # The DISTILLATION path computes log_softmax at the default temperature;
+        # re-scale here so that a non-default temperature config takes effect.
+        if self.temperature != 1.0:
+            student_topk_logprobs = student_topk_logprobs / self.temperature
+            teacher_topk_logprobs = teacher_topk_logprobs / self.temperature
+            # Re-normalize within top-k after rescaling
+            student_topk_logprobs = student_topk_logprobs - student_topk_logprobs.logsumexp(dim=-1, keepdim=True)
+            teacher_topk_logprobs = teacher_topk_logprobs - teacher_topk_logprobs.logsumexp(dim=-1, keepdim=True)
+
         # Convert logprobs to probs
         student_topk_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_topk_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
@@ -357,11 +370,10 @@ class GoldTrainLossFn:
         student_topk_probs = student_topk_probs * s_cond_scale
         teacher_topk_probs = teacher_topk_probs * t_cond_scale
 
-        # Identify matched/unmatched in top-k indices
+        # Identify matched/unmatched using ORIGINAL teacher indices
         teacher_matched_mask_full = self.vocab_mapping.teacher_matched_mask  # [V_teacher]
         max_idx = teacher_matched_mask_full.shape[0]
-        # Clamp indices to valid range
-        safe_indices = teacher_topk_indices.clamp(0, max_idx - 1)
+        safe_indices = teacher_topk_indices_orig.clamp(0, max_idx - 1)
         topk_is_matched = teacher_matched_mask_full[safe_indices]  # [B, S-1, k] bool
 
         # ---- Matched tokens: JSD ----
@@ -412,10 +424,12 @@ class GoldTrainLossFn:
         # ---- Combine ----
         per_pos_loss = self.matched_weight * matched_loss + self.unmatched_weight * unmatched_loss
         # Average over valid positions per sample
-        n_valid_per_sample = position_mask.sum(-1).clamp(min=1)  # [B]
+        n_groups_per_sample = position_mask.sum(-1)  # [B] actual group count
+        n_valid_per_sample = n_groups_per_sample.clamp(min=1)  # [B] for safe division
         per_sample_loss = per_pos_loss.sum(-1) / n_valid_per_sample  # [B]
 
-        valid_sample_mask = (n_valid_per_sample > 0).float() * sample_mask
+        # Only include samples that actually have alignment groups
+        valid_sample_mask = (n_groups_per_sample > 0).float() * sample_mask
         if valid_sample_mask.sum() == 0:
             loss = student_topk_logprobs.sum() * 0.0
             return loss, {

@@ -299,15 +299,23 @@ def pack_gold_alignment_into_data(
     student_prompt_lengths: list[int],
     seq_len: int,
     topk_k: int,
+    vocab_mapping: VocabMapping,
 ) -> dict[str, torch.Tensor]:
     """Pack alignment + teacher top-k into tensors indexed by student positions.
 
-    The DISTILLATION loss path expects ``teacher_topk_logits`` and
-    ``teacher_topk_indices`` as ``[B, S_student, k]`` — one top-k per
-    student sequence position. For each student position that is the
-    first token of an alignment group, we fill in the teacher top-k from
-    the corresponding teacher position. Other positions get zeros and are
-    masked out by ``gold_position_mask``.
+    The DISTILLATION loss path gathers student logprobs at specified indices
+    via ``get_distillation_topk_logprobs_from_logits``. For cross-tokenizer
+    GOLD, teacher top-k indices are in the teacher's vocabulary space — we
+    must remap matched tokens to the student's vocabulary so the gathered
+    student logprobs correspond to semantically equivalent tokens.
+
+    Remapping strategy:
+    - Matched teacher tokens → replaced with the corresponding student ID
+    - Unmatched teacher tokens → kept as-is (their student logprobs are
+      not semantically meaningful, but the sorted L1 loss only uses
+      relative ordering anyway)
+
+    All tensors are padded to ``[B, seq_len]`` (student sequence length).
 
     Args:
         alignments: Per-sample alignment results.
@@ -319,14 +327,20 @@ def pack_gold_alignment_into_data(
         student_prompt_lengths: Per-sample student prompt lengths.
         seq_len: Student sequence length for padding.
         topk_k: Number of top-k.
+        vocab_mapping: Vocabulary mapping for teacher→student ID remapping.
 
     Returns:
         Dict of tensors to merge into train_data.
     """
     batch_size = len(alignments)
 
+    # Pre-build the teacher→student remapping tensor
+    mapping = vocab_mapping.mapping_tensor  # teacher_id → student_id (or -1)
+    max_teacher_id = mapping.shape[0]
+
     # Tensors indexed by STUDENT sequence position
     packed_teacher_topk_logits = torch.zeros(batch_size, seq_len, topk_k)
+    packed_student_gather_indices = torch.zeros(batch_size, seq_len, topk_k, dtype=torch.long)
     packed_teacher_topk_indices = torch.zeros(batch_size, seq_len, topk_k, dtype=torch.long)
     gold_position_mask = torch.zeros(batch_size, seq_len)
     gold_teacher_cond_factor = torch.zeros(batch_size, seq_len)
@@ -346,22 +360,32 @@ def pack_gold_alignment_into_data(
             if not chunk.teacher_token_indices or not chunk.student_token_indices:
                 continue
 
-            # Teacher: first token position (generation-relative)
             t_first_gen_pos = chunk.teacher_token_indices[0]
             t_seq_pos = t_prompt_len + t_first_gen_pos
             if t_seq_pos >= t_topk_seq_len:
                 continue
 
-            # Student: first token position (generation-relative)
             s_first_gen_pos = chunk.student_token_indices[0]
-            # Map to student SEQUENCE position (prompt + gen)
             s_seq_pos = s_prompt_len + s_first_gen_pos
             if s_seq_pos >= seq_len:
                 continue
 
-            # Place teacher top-k at the corresponding student position
+            # Teacher top-k logits (stay in teacher space, used for teacher probs)
             packed_teacher_topk_logits[b, s_seq_pos, :] = teacher_topk_logits[b, t_seq_pos, :]
-            packed_teacher_topk_indices[b, s_seq_pos, :] = teacher_topk_indices[b, t_seq_pos, :]
+
+            # Original teacher indices (for matched/unmatched classification)
+            t_indices = teacher_topk_indices[b, t_seq_pos, :]
+            packed_teacher_topk_indices[b, s_seq_pos, :] = t_indices
+
+            # Remap teacher indices to student vocab for gathering student logprobs:
+            # matched tokens → student ID; unmatched → keep teacher ID as-is
+            remapped = t_indices.clone()
+            for j in range(topk_k):
+                tid = int(t_indices[j].item())
+                if 0 <= tid < max_teacher_id and mapping[tid].item() >= 0:
+                    remapped[j] = mapping[tid]
+            packed_student_gather_indices[b, s_seq_pos, :] = remapped
+
             gold_position_mask[b, s_seq_pos] = 1.0
 
             # Teacher conditional factor
@@ -382,8 +406,11 @@ def pack_gold_alignment_into_data(
                 gold_student_cond_factor[b, s_seq_pos] = s_cond
 
     return {
-        "teacher_topk_logits": packed_teacher_topk_logits,       # standard key for DISTILLATION path
-        "teacher_topk_indices": packed_teacher_topk_indices,     # standard key for DISTILLATION path
+        "teacher_topk_logits": packed_teacher_topk_logits,
+        # Remapped indices for the DISTILLATION path to gather student logprobs
+        "teacher_topk_indices": packed_student_gather_indices,
+        # Original teacher indices for matched/unmatched classification
+        "gold_teacher_topk_indices_original": packed_teacher_topk_indices,
         "gold_position_mask": gold_position_mask,
         "gold_teacher_cond_factor": gold_teacher_cond_factor,
         "gold_student_cond_factor": gold_student_cond_factor,
@@ -1026,6 +1053,7 @@ def gold_distillation_train(
                         student_prompt_lengths=prompt_lengths,
                         seq_len=student_input_ids.shape[1],
                         topk_k=teacher_topk_k,
+                        vocab_mapping=vocab_mapping,
                     )
 
                 # ---- 9) Train student ----
@@ -1040,10 +1068,11 @@ def gold_distillation_train(
                     "input_lengths": input_lengths,
                     "token_mask": student_token_mask,
                     "sample_mask": repeated_batch["loss_multiplier"],
-                    # Standard keys for DISTILLATION path (per student position)
+                    # Standard keys for DISTILLATION path (remapped to student vocab)
                     "teacher_topk_logits": alignment_data["teacher_topk_logits"],
                     "teacher_topk_indices": alignment_data["teacher_topk_indices"],
-                    # GOLD-specific alignment data
+                    # GOLD-specific: original teacher indices for matched/unmatched
+                    "gold_teacher_topk_indices_original": alignment_data["gold_teacher_topk_indices_original"],
                     "gold_position_mask": alignment_data["gold_position_mask"],
                     "gold_teacher_cond_factor": alignment_data["gold_teacher_cond_factor"],
                     "gold_student_cond_factor": alignment_data["gold_student_cond_factor"],

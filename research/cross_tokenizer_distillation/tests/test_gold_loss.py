@@ -224,8 +224,10 @@ class TestGoldTrainLossFn:
 
     def _make_data(self, batch_size=2, seq_len=8, topk_k=4, n_groups=3):
         """Create mock data dict for GOLD loss (DISTILLATION interface)."""
+        teacher_indices = torch.randint(0, 4, (batch_size, seq_len, topk_k))
         data = {
-            "teacher_topk_indices": torch.randint(0, 4, (batch_size, seq_len, topk_k)),
+            # Original teacher indices for matched/unmatched classification
+            "gold_teacher_topk_indices_original": teacher_indices.clone(),
             "gold_position_mask": torch.zeros(batch_size, seq_len),
             "gold_teacher_cond_factor": torch.zeros(batch_size, seq_len),
             "gold_student_cond_factor": torch.zeros(batch_size, seq_len),
@@ -235,10 +237,10 @@ class TestGoldTrainLossFn:
         for b in range(batch_size):
             for g in range(min(n_groups, seq_len)):
                 data["gold_position_mask"][b, g] = 1.0
-                data["teacher_topk_indices"][b, g, 0] = 0  # matched
-                data["teacher_topk_indices"][b, g, 1] = 1  # matched
-                data["teacher_topk_indices"][b, g, 2] = 2  # unmatched
-                data["teacher_topk_indices"][b, g, 3] = 3  # unmatched
+                data["gold_teacher_topk_indices_original"][b, g, 0] = 0  # matched
+                data["gold_teacher_topk_indices_original"][b, g, 1] = 1  # matched
+                data["gold_teacher_topk_indices_original"][b, g, 2] = 2  # unmatched
+                data["gold_teacher_topk_indices_original"][b, g, 3] = 3  # unmatched
         return data
 
     def _make_topk_logprobs(self, batch_size=2, seq_len=8, topk_k=4):
