@@ -1,0 +1,33 @@
+defaults: dapo-qwen35-35b-bf16-8k.yaml
+policy:
+  optimizer: null
+  scheduler: null
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    sequence_parallel: false
+    freeze_moe_router: false
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: false
+      clip_grad: ${policy.max_grad_norm}
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-08

@@ -1355,6 +1355,7 @@ def get_next_token_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1389,6 +1390,7 @@ def get_next_token_logprobs_from_logits(
             tp_group=vocab_parallel_group,
             inference_only=False,
             cp_group=context_parallel_group,
+            chunk_size=chunk_size,
             sampling_params=sampling_params,
         )
         # slice off to the correct length to remove potential CP padding
@@ -1399,6 +1401,7 @@ def get_next_token_logprobs_from_logits(
             next_token_logits,
             input_ids,
             seq_index=seq_index,
+            chunk_size=chunk_size,
             sampling_params=sampling_params,
         )
 
