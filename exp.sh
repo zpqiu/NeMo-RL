@@ -63,8 +63,8 @@ export WANDB_API_KEY
 # ── Defaults (experiment file can override any of these) ──────────
 
 NUM_NODES=1
-PARTITION=batch_short
-TIME="2:0:0"
+PARTITION=batch
+TIME="4:0:0"
 GPUS_PER_NODE=8
 
 EXP_NAME=""   # REQUIRED
