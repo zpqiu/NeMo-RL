@@ -263,6 +263,7 @@ class TestGoldTrainLossFn:
         loss, metrics = loss_fn(
             student_topk_logprobs=s_lp,
             teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp,
             H_all=None,
             data=data,
             global_valid_seqs=torch.tensor(float(batch_size)),
@@ -284,7 +285,8 @@ class TestGoldTrainLossFn:
         data = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
 
         loss, _ = loss_fn(
-            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp, H_all=None,
             data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
@@ -301,7 +303,8 @@ class TestGoldTrainLossFn:
         data["gold_position_mask"][:] = 0
 
         loss, metrics = loss_fn(
-            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp, H_all=None,
             data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
@@ -316,7 +319,8 @@ class TestGoldTrainLossFn:
 
         data_zero = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
         loss_zero, _ = loss_fn(
-            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp, H_all=None,
             data=data_zero, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
@@ -324,7 +328,8 @@ class TestGoldTrainLossFn:
         data_nonzero["gold_teacher_cond_factor"][:, :2] = -0.5
         data_nonzero["gold_student_cond_factor"][:, :2] = -0.3
         loss_nonzero, _ = loss_fn(
-            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp, H_all=None,
             data=data_nonzero, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
@@ -345,8 +350,49 @@ class TestGoldTrainLossFn:
         s_lp, t_lp = self._make_topk_logprobs(1, seq_len, topk_k)
         data = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
         loss, metrics = loss_fn(
-            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp, H_all=None,
+            student_topk_logprobs=s_lp, teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp, H_all=None,
             data=data, global_valid_seqs=torch.tensor(1.0), global_valid_toks=torch.tensor(8.0),
         )
 
         assert torch.isfinite(loss)
+
+    def test_cond_factors_change_matched_jsd_without_unmatched_term(self, basic_setup):
+        """Matched JSD should change when cond factors change and unmatched term is disabled."""
+        mapping = basic_setup.vocab_mapping
+        cfg: GoldLossConfig = {
+            "jsd_beta": 0.5,
+            "matched_weight": 1.0,
+            "unmatched_weight": 0.0,
+            "temperature": 1.0,
+        }
+        loss_fn = GoldTrainLossFn(cfg, mapping)
+
+        seq_len, topk_k = 8, 4
+        s_lp, t_lp = self._make_topk_logprobs(1, seq_len, topk_k)
+
+        data_zero = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
+        _, metrics_zero = loss_fn(
+            student_topk_logprobs=s_lp,
+            teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp,
+            H_all=None,
+            data=data_zero,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(8.0),
+        )
+
+        data_scaled = self._make_data(batch_size=1, seq_len=seq_len, topk_k=topk_k, n_groups=2)
+        data_scaled["gold_teacher_cond_factor"][:, :2] = -0.5
+        data_scaled["gold_student_cond_factor"][:, :2] = -0.3
+        _, metrics_scaled = loss_fn(
+            student_topk_logprobs=s_lp,
+            teacher_topk_logprobs=t_lp,
+            student_unmatched_topk_logprobs=s_lp,
+            H_all=None,
+            data=data_scaled,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(8.0),
+        )
+
+        assert metrics_zero["matched_jsd_loss"] != pytest.approx(metrics_scaled["matched_jsd_loss"], abs=1e-6)

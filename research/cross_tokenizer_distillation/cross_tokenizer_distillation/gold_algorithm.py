@@ -316,6 +316,9 @@ def pack_gold_alignment_into_data(
       relative ordering anyway)
 
     All tensors are padded to ``[B, seq_len]`` (student sequence length).
+    Entries are written at predictor slots, not token slots: a group whose first
+    generated token is at token position ``p`` is stored at slot ``p - 1`` so it
+    aligns with the causal next-token logits consumed during training.
 
     Args:
         alignments: Per-sample alignment results.
@@ -361,12 +364,16 @@ def pack_gold_alignment_into_data(
                 continue
 
             t_first_gen_pos = chunk.teacher_token_indices[0]
-            t_seq_pos = t_prompt_len + t_first_gen_pos
+            t_seq_pos = t_prompt_len - 1 + t_first_gen_pos
+            if t_seq_pos < 0:
+                continue
             if t_seq_pos >= t_topk_seq_len:
                 continue
 
             s_first_gen_pos = chunk.student_token_indices[0]
-            s_seq_pos = s_prompt_len + s_first_gen_pos
+            s_seq_pos = s_prompt_len - 1 + s_first_gen_pos
+            if s_seq_pos < 0:
+                continue
             if s_seq_pos >= seq_len:
                 continue
 
@@ -377,9 +384,11 @@ def pack_gold_alignment_into_data(
             t_indices = teacher_topk_indices[b, t_seq_pos, :]
             packed_teacher_topk_indices[b, s_seq_pos, :] = t_indices
 
-            # Remap teacher indices to student vocab for gathering student logprobs:
-            # matched tokens → student ID; unmatched → keep teacher ID as-is
-            remapped = t_indices.clone()
+            # Remap teacher indices to student vocab for the student-side teacher-view.
+            # Unmatched teacher tokens are routed to a safe placeholder index and are
+            # ignored by the matched branch; the unmatched branch now uses the student's
+            # own unmatched top-k selected from current logits.
+            remapped = torch.zeros_like(t_indices)
             for j in range(topk_k):
                 tid = int(t_indices[j].item())
                 if 0 <= tid < max_teacher_id and mapping[tid].item() >= 0:

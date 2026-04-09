@@ -104,25 +104,34 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
-        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-        student_topk_logprobs, teacher_topk_logprobs, H_all = (
-            get_distillation_topk_logprobs_from_logits(
-                student_logits=logits,
-                teacher_topk_logits=data["teacher_topk_logits"],
-                teacher_topk_indices=data["teacher_topk_indices"],
-                zero_outside_topk=loss_fn.zero_outside_topk,
-                calculate_entropy=calculate_entropy,
+        if hasattr(loss_fn, "prepare_distillation_loss_input"):
+            loss_input = loss_fn.prepare_distillation_loss_input(
+                logits=logits,
+                data=data,
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
             )
-        )
+        else:
+            calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+            student_topk_logprobs, teacher_topk_logprobs, H_all = (
+                get_distillation_topk_logprobs_from_logits(
+                    student_logits=logits,
+                    teacher_topk_logits=data["teacher_topk_logits"],
+                    teacher_topk_indices=data["teacher_topk_indices"],
+                    zero_outside_topk=loss_fn.zero_outside_topk,
+                    calculate_entropy=calculate_entropy,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                )
+            )
 
-        loss_input = {
-            "student_topk_logprobs": student_topk_logprobs,
-            "teacher_topk_logprobs": teacher_topk_logprobs,
-            "H_all": H_all,
-        }
+            loss_input = {
+                "student_topk_logprobs": student_topk_logprobs,
+                "teacher_topk_logprobs": teacher_topk_logprobs,
+                "H_all": H_all,
+            }
 
     else:
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")

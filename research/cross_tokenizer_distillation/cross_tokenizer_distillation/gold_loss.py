@@ -26,15 +26,21 @@ Reference: https://huggingface.co/spaces/HuggingFaceH4/on-policy-distillation
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 try:
     from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
     from nemo_rl.algorithms.utils import masked_mean
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.distributed.model_utils import (
+        _get_tokens_on_this_cp_rank,
+        distributed_vocab_topk,
+        gather_logits_at_global_indices,
+    )
 
     _HAS_NEMO_RL = True
 except ImportError:
@@ -292,13 +298,247 @@ class GoldTrainLossFn:
         """Move vocab mapping tensors to the correct device once."""
         if not self._device_initialized:
             self.vocab_mapping.teacher_matched_mask = self.vocab_mapping.teacher_matched_mask.to(device)
+            self.vocab_mapping.student_matched_mask = self.vocab_mapping.student_matched_mask.to(device)
             self.vocab_mapping.mapping_tensor = self.vocab_mapping.mapping_tensor.to(device)
             self._device_initialized = True
+
+    def _resolve_parallel_context(
+        self,
+        student_logits: torch.Tensor,
+        vocab_parallel_rank: Optional[int],
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+        context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.distributed.ProcessGroup],
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+    ]:
+        """Return local logits and parallel metadata for TP/CP-aware gathers."""
+        cp_group = context_parallel_group
+        if isinstance(student_logits, DTensor):
+            device_mesh = student_logits.device_mesh
+            tp_group = device_mesh.get_group("tp")
+            local_logits = student_logits.to_local()
+            tp_rank = tp_group.rank()
+            vocab_local = int(local_logits.shape[-1])
+            vocab_start = tp_rank * vocab_local
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+            return local_logits, tp_group, cp_group, vocab_start, vocab_start + vocab_local
+
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be set when vocab_parallel_group is provided"
+            )
+            local_logits = student_logits
+            vocab_local = int(local_logits.shape[-1])
+            vocab_start = vocab_parallel_rank * vocab_local
+            return (
+                local_logits,
+                vocab_parallel_group,
+                cp_group,
+                vocab_start,
+                vocab_start + vocab_local,
+            )
+
+        local_logits = student_logits
+        vocab_end = int(local_logits.shape[-1])
+        return local_logits, None, cp_group, 0, vocab_end
+
+    def _localize_sequence_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        device: torch.device,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Convert CP-sharded DTensors to local tensors aligned with local logits."""
+        if isinstance(tensor, DTensor):
+            return tensor.to_local().to(device)
+        tensor = tensor.to(device)
+        if cp_group is None or torch.distributed.get_world_size(cp_group) == 1:
+            return tensor
+        cp_rank = torch.distributed.get_rank(cp_group)
+        return _get_tokens_on_this_cp_rank(tensor, cp_rank, torch.distributed.get_world_size(cp_group), seq_dim=1)
+
+    def _gather_student_logits_at_indices(
+        self,
+        student_logits: torch.Tensor,
+        global_indices: torch.Tensor,
+        vocab_parallel_rank: Optional[int],
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+        context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Differentiably gather logits at global vocab ids for local sequence positions."""
+        local_logits, tp_group, cp_group, vocab_start, vocab_end = self._resolve_parallel_context(
+            student_logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        indices_local = self._localize_sequence_tensor(
+            global_indices,
+            device=local_logits.device,
+            cp_group=cp_group,
+        )
+        if tp_group is not None or cp_group is not None:
+            return gather_logits_at_global_indices(
+                local_logits,
+                indices_local,
+                tp_group=tp_group,
+                cp_group=cp_group,
+                vocab_start_index=vocab_start,
+                vocab_end_index=vocab_end,
+            )
+        return local_logits.gather(dim=-1, index=indices_local)
+
+    def _topk_student_unmatched_indices(
+        self,
+        student_logits: torch.Tensor,
+        k: int,
+        vocab_parallel_rank: Optional[int],
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+        context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Select student unmatched top-k ids per position for the current forward pass."""
+        available_unmatched = max(
+            int(self.vocab_mapping.student_vocab_size - self.vocab_mapping.num_matched),
+            0,
+        )
+        k = min(k, available_unmatched)
+        local_logits, tp_group, cp_group, vocab_start, vocab_end = self._resolve_parallel_context(
+            student_logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        if k <= 0:
+            shape = (*local_logits.shape[:2], 0)
+            return torch.zeros(shape, dtype=torch.long, device=local_logits.device)
+
+        logits_for_topk = local_logits.detach().to(torch.float32)
+        student_matched_mask = self.vocab_mapping.student_matched_mask.to(local_logits.device)
+        local_student_matched = student_matched_mask[vocab_start:vocab_end]
+        logits_for_topk = logits_for_topk.masked_fill(
+            local_student_matched.view(1, 1, -1),
+            float("-inf"),
+        )
+
+        if tp_group is not None:
+            _, topk_indices = distributed_vocab_topk(
+                logits_for_topk,
+                k=k,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start,
+                vocab_end_index=vocab_end,
+            )
+            return topk_indices
+
+        k_eff = min(k, int(logits_for_topk.shape[-1]))
+        if k_eff <= 0:
+            shape = (*logits_for_topk.shape[:2], 0)
+            return torch.zeros(shape, dtype=torch.long, device=logits_for_topk.device)
+        topk_indices = torch.topk(logits_for_topk, k=k_eff, dim=-1).indices
+        return topk_indices + vocab_start
+
+    def prepare_distillation_loss_input(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Prepare GOLD-specific distillation tensors from current student logits."""
+        local_logits, _, cp_group, _, _ = self._resolve_parallel_context(
+            logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        device = local_logits.device
+        self._ensure_device(device)
+
+        teacher_topk_logits = self._localize_sequence_tensor(
+            data["teacher_topk_logits"],
+            device=device,
+            cp_group=cp_group,
+        )
+        teacher_topk_indices_orig = self._localize_sequence_tensor(
+            data["gold_teacher_topk_indices_original"],
+            device=device,
+            cp_group=cp_group,
+        )
+
+        max_teacher_idx = max(int(self.vocab_mapping.teacher_matched_mask.shape[0]) - 1, 0)
+        teacher_match_indices = teacher_topk_indices_orig.clamp(0, max_teacher_idx)
+        teacher_is_matched = self.vocab_mapping.teacher_matched_mask[teacher_match_indices]
+
+        mapped_student_indices = torch.zeros_like(teacher_topk_indices_orig)
+        if self.vocab_mapping.mapping_tensor.numel() > 0:
+            safe_mapping_idx = teacher_topk_indices_orig.clamp(
+                0, int(self.vocab_mapping.mapping_tensor.shape[0]) - 1
+            )
+            mapping_valid = (teacher_topk_indices_orig >= 0) & (
+                teacher_topk_indices_orig < int(self.vocab_mapping.mapping_tensor.shape[0])
+            )
+            mapped_values = self.vocab_mapping.mapping_tensor[safe_mapping_idx].clamp(min=0)
+            mapped_student_indices = torch.where(
+                mapping_valid,
+                mapped_values,
+                mapped_student_indices,
+            )
+
+        student_teacher_view_logits = self._gather_student_logits_at_indices(
+            logits,
+            mapped_student_indices,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        unmatched_counts = (~teacher_is_matched).sum(dim=-1)
+        max_unmatched_k = int(unmatched_counts.max().item()) if unmatched_counts.numel() > 0 else 0
+        if max_unmatched_k > 0:
+            student_unmatched_indices = self._topk_student_unmatched_indices(
+                logits,
+                k=max_unmatched_k,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            student_unmatched_logits = self._gather_student_logits_at_indices(
+                logits,
+                student_unmatched_indices,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            student_unmatched_topk_logprobs = torch.log_softmax(student_unmatched_logits, dim=-1)
+        else:
+            student_unmatched_topk_logprobs = teacher_topk_logits.new_zeros(
+                teacher_topk_logits.shape[0],
+                teacher_topk_logits.shape[1],
+                0,
+            )
+
+        return {
+            "student_topk_logprobs": torch.log_softmax(student_teacher_view_logits, dim=-1),
+            "teacher_topk_logprobs": torch.log_softmax(teacher_topk_logits, dim=-1),
+            "student_unmatched_topk_logprobs": student_unmatched_topk_logprobs,
+            "H_all": None,
+        }
 
     def __call__(
         self,
         student_topk_logprobs: torch.Tensor,
         teacher_topk_logprobs: torch.Tensor,
+        student_unmatched_topk_logprobs: torch.Tensor | None,
         H_all: torch.Tensor | None,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
@@ -307,8 +547,10 @@ class GoldTrainLossFn:
         """Compute GOLD hybrid loss from top-k logprobs.
 
         Args:
-            student_topk_logprobs: [B, S-1, k] student log-probs at teacher's top-k indices.
-            teacher_topk_logprobs: [B, S-1, k] teacher log-probs at top-k indices.
+            student_topk_logprobs: [B, S, k] student log-probs at remapped teacher top-k indices.
+            teacher_topk_logprobs: [B, S, k] teacher log-probs at top-k indices.
+            student_unmatched_topk_logprobs: [B, S, k_u] student log-probs at the
+                student's own unmatched top-k indices for each position.
             H_all: Student entropy (unused, may be None).
             data: Data dict with alignment masks and conditional factors.
             global_valid_seqs: Number of valid sequences for normalization.
@@ -321,25 +563,20 @@ class GoldTrainLossFn:
         self._ensure_device(device)
 
         batch_size = student_topk_logprobs.shape[0]
-        seq_len = student_topk_logprobs.shape[1]  # S-1
-        topk_k = student_topk_logprobs.shape[2]
+        seq_len = student_topk_logprobs.shape[1]
 
         # Unpack data dict
-        # Use ORIGINAL teacher indices for matched/unmatched classification
-        # (the "teacher_topk_indices" key has been remapped to student vocab
-        # for the DISTILLATION gather path, so use the original for classification)
-        teacher_topk_indices_orig = data["gold_teacher_topk_indices_original"].to(device)  # (B, S, k)
-        # Align to S-1 (the DISTILLATION path shifts by 1)
+        teacher_topk_indices_orig = data["gold_teacher_topk_indices_original"].to(device)
         if teacher_topk_indices_orig.shape[1] > seq_len:
             teacher_topk_indices_orig = teacher_topk_indices_orig[:, :seq_len, :]
 
-        position_mask = data["gold_position_mask"].to(device)  # (B, S)
+        position_mask = data["gold_position_mask"].to(device)
         if position_mask.shape[1] > seq_len:
             position_mask = position_mask[:, :seq_len]
-        teacher_cond_factor = data["gold_teacher_cond_factor"].to(device)  # (B, S)
+        teacher_cond_factor = data["gold_teacher_cond_factor"].to(device)
         if teacher_cond_factor.shape[1] > seq_len:
             teacher_cond_factor = teacher_cond_factor[:, :seq_len]
-        student_cond_factor = data["gold_student_cond_factor"].to(device)  # (B, S)
+        student_cond_factor = data["gold_student_cond_factor"].to(device)
         if student_cond_factor.shape[1] > seq_len:
             student_cond_factor = student_cond_factor[:, :seq_len]
 
@@ -360,38 +597,40 @@ class GoldTrainLossFn:
             teacher_topk_logprobs = teacher_topk_logprobs - teacher_topk_logprobs.logsumexp(dim=-1, keepdim=True)
 
         # Convert logprobs to probs
-        student_topk_probs = student_topk_logprobs.exp()  # [B, S-1, k]
-        teacher_topk_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
+        student_topk_probs = student_topk_logprobs.exp()
+        teacher_topk_probs = teacher_topk_logprobs.exp()
+        if student_unmatched_topk_logprobs is None:
+            student_unmatched_topk_probs = student_topk_probs.new_zeros(batch_size, seq_len, 0)
+        else:
+            if self.temperature != 1.0:
+                student_unmatched_topk_logprobs = student_unmatched_topk_logprobs / self.temperature
+                student_unmatched_topk_logprobs = (
+                    student_unmatched_topk_logprobs
+                    - student_unmatched_topk_logprobs.logsumexp(dim=-1, keepdim=True)
+                )
+            student_unmatched_topk_probs = student_unmatched_topk_logprobs.exp()
 
         # Apply conditional factors (multiply probs by scalar per position)
         eps = 1e-8
-        s_cond_scale = torch.exp(student_cond_factor).clamp(min=eps).unsqueeze(-1)  # [B, S, 1]
+        s_cond_scale = torch.exp(student_cond_factor).clamp(min=eps).unsqueeze(-1)
         t_cond_scale = torch.exp(teacher_cond_factor).clamp(min=eps).unsqueeze(-1)
         student_topk_probs = student_topk_probs * s_cond_scale
         teacher_topk_probs = teacher_topk_probs * t_cond_scale
+        student_unmatched_topk_probs = student_unmatched_topk_probs * s_cond_scale
 
         # Identify matched/unmatched using ORIGINAL teacher indices
-        teacher_matched_mask_full = self.vocab_mapping.teacher_matched_mask  # [V_teacher]
+        teacher_matched_mask_full = self.vocab_mapping.teacher_matched_mask
         max_idx = teacher_matched_mask_full.shape[0]
         safe_indices = teacher_topk_indices_orig.clamp(0, max_idx - 1)
-        topk_is_matched = teacher_matched_mask_full[safe_indices]  # [B, S-1, k] bool
+        topk_is_matched = teacher_matched_mask_full[safe_indices]
 
         # ---- Matched tokens: JSD ----
-        # Compute per-position JSD over matched top-k tokens
-        matched_count = topk_is_matched.float()  # [B, S-1, k]
-        # Mask out unmatched tokens for JSD
+        matched_count = topk_is_matched.float()
         s_matched = student_topk_probs * matched_count
         t_matched = teacher_topk_probs * matched_count
-        # Renormalize within matched tokens per position
-        s_matched_sum = s_matched.sum(-1, keepdim=True).clamp(min=eps)
-        t_matched_sum = t_matched.sum(-1, keepdim=True).clamp(min=eps)
-        s_matched_norm = s_matched / s_matched_sum
-        t_matched_norm = t_matched / t_matched_sum
+        s_log = torch.log(s_matched.clamp(min=eps))
+        t_log = torch.log(t_matched.clamp(min=eps))
 
-        s_log = torch.log(s_matched_norm.clamp(min=eps))
-        t_log = torch.log(t_matched_norm.clamp(min=eps))
-
-        # Generalized JSD per position
         if self.jsd_beta == 0.0:
             per_pos_jsd = F.kl_div(s_log, t_log, reduction="none", log_target=True)
         elif self.jsd_beta == 1.0:
@@ -405,21 +644,26 @@ class GoldTrainLossFn:
             kl_s = F.kl_div(mixture, s_log, reduction="none", log_target=True)
             per_pos_jsd = beta_t * kl_t + (1.0 - beta_t) * kl_s
 
-        # Mask to matched tokens only and sum over vocab dim
-        per_pos_jsd = (per_pos_jsd * matched_count).sum(-1)  # [B, S-1]
-        # Mask to valid alignment positions
-        matched_loss = per_pos_jsd * position_mask  # [B, S-1]
+        per_pos_jsd = (per_pos_jsd * matched_count).sum(-1)
+        matched_present = (matched_count.sum(-1) > 0).float()
+        matched_loss = per_pos_jsd * position_mask * matched_present
 
         # ---- Unmatched tokens: sorted L1 ----
         unmatched_count = (~topk_is_matched).float()
-        s_unmatched = student_topk_probs * unmatched_count
         t_unmatched = teacher_topk_probs * unmatched_count
 
-        # Sort unmatched probs per position and compute L1
-        s_unsorted = s_unmatched.sort(dim=-1, descending=True).values
+        s_unsorted = student_unmatched_topk_probs.sort(dim=-1, descending=True).values
         t_unsorted = t_unmatched.sort(dim=-1, descending=True).values
-        per_pos_l1 = (s_unsorted - t_unsorted).abs().sum(-1)  # [B, S-1]
-        unmatched_loss = per_pos_l1 * position_mask  # [B, S-1]
+        sv = s_unsorted.size(-1)
+        tv = t_unsorted.size(-1)
+        max_v = max(sv, tv)
+        if sv < max_v:
+            s_unsorted = F.pad(s_unsorted, (0, max_v - sv))
+        if tv < max_v:
+            t_unsorted = F.pad(t_unsorted, (0, max_v - tv))
+        per_pos_l1 = (s_unsorted - t_unsorted).abs().sum(-1)
+        unmatched_present = (unmatched_count.sum(-1) > 0).float()
+        unmatched_loss = per_pos_l1 * position_mask * unmatched_present
 
         # ---- Combine ----
         per_pos_loss = self.matched_weight * matched_loss + self.unmatched_weight * unmatched_loss
