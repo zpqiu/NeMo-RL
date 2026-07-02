@@ -28,6 +28,9 @@ DATASET_PARQUET="${MATH_CODE_DATASET_PARQUET:-default/train/0000.parquet}"
 DATASET_ALIAS="${MATH_CODE_DATASET_ALIAS:-dapo_math_17k}"
 EXPECTED_TASKS="${MATH_CODE_EXPECTED_TASKS:-17398}"
 SIF_PATH="${MATH_CODE_SIF_PATH:?set MATH_CODE_SIF_PATH to the shared math-code SIF path}"
+# Bake ReTool-style tool-use reward shaping into the built tasks (train sets
+# only; leave off for eval sets so accuracy metrics stay pure).
+TOOL_SHAPING="${MATH_CODE_TOOL_SHAPING:-0}"
 BUILD_ROOT="${MATH_CODE_BUILD_ROOT:-/tmp/math_code_17k_build_${SLURM_JOB_ID:-$$}}"
 TASKS_DIR="$BUILD_ROOT/$DATASET_ALIAS"
 JSONL_PATH="${MATH_CODE_JSONL_PATH:-$DATA_ROOT/${DATASET_ALIAS}.jsonl}"
@@ -72,6 +75,10 @@ PARQUET_PATH="$DOWNLOAD_DIR/$DATASET_PARQUET"
 [[ -f "$PARQUET_PATH" ]] || fail "hf download did not return a parquet path: $PARQUET_PATH"
 
 log "convert parquet=$PARQUET_PATH tasks=$EXPECTED_TASKS local_build=$TASKS_DIR"
+SHAPING_ARGS=()
+if [[ "$TOOL_SHAPING" == "1" ]]; then
+    SHAPING_ARGS+=(--tool-shaping)
+fi
 uv run python "$HARBOR_ROOT/math_code/prepare_dataset.py" \
     --dataset "$DATASET_REPO" \
     --dataset-alias "$DATASET_ALIAS" \
@@ -80,6 +87,7 @@ uv run python "$HARBOR_ROOT/math_code/prepare_dataset.py" \
     --sif-path "$SIF_PATH" \
     --tasks-dir "$TASKS_DIR" \
     --jsonl-path "$JSONL_PATH" \
+    ${SHAPING_ARGS[@]+"${SHAPING_ARGS[@]}"} \
     --overwrite
 
 ACTUAL_TASKS="$(find "$TASKS_DIR" -mindepth 1 -maxdepth 1 -type d \

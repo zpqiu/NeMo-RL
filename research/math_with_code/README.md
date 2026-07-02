@@ -95,8 +95,14 @@ MATH_CODE_DATASET_REVISION=main \
 MATH_CODE_DATASET_PARQUET=data/train-00000-of-00001.parquet \
 MATH_CODE_DATASET_ALIAS=dapo_math_17k_non8 \
 MATH_CODE_EXPECTED_TASKS=6389 \
+MATH_CODE_TOOL_SHAPING=1 \
     scripts/prepare_math_code_17k.sh
 ```
+
+`MATH_CODE_TOOL_SHAPING=1` bakes ReTool-style reward shaping into the built
+tasks (failed answers earn 0.1 per executed tool call, capped at 0.4; see
+`math_code/templates/verify.py`). Use it for train sets only, so eval accuracy
+stays a pure correctness metric.
 
 Harbor trial outputs land in `responses_api_agents/harbor_agent/jobs/`
 (gitignored). Successful trials are deleted automatically; failed ones are kept
