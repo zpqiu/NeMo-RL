@@ -1,0 +1,6 @@
+# Local-only backup of retired tooling (difficulty labeling, removed tests).
+# Kept on the cluster for reference, intentionally not tracked in git.
+archive/
+
+# Cluster-specific launchers carrying private account/storage paths.
+experiments/
