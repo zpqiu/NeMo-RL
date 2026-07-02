@@ -47,6 +47,14 @@ def _assistant_text(trajectory: dict[str, Any]) -> str:
     )
 
 
+def _count_tool_calls(trajectory: dict[str, Any]) -> int:
+    return sum(
+        len(step.get("tool_calls") or [])
+        for step in trajectory.get("steps", [])
+        if step.get("source") == "agent"
+    )
+
+
 def verify(expected: str, generated: str) -> tuple[float, str | None]:
     metric = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),
@@ -75,6 +83,7 @@ def main() -> int:
     parser.add_argument("--expected", type=Path, required=True)
     parser.add_argument("--trajectory", type=Path, required=True)
     parser.add_argument("--details", type=Path, required=True)
+    parser.add_argument("--reward", type=Path, required=True)
     args = parser.parse_args()
 
     logging.getLogger("math_verify").setLevel(logging.CRITICAL)
@@ -84,9 +93,25 @@ def main() -> int:
         trajectory = json.loads(args.trajectory.read_text())
         generated = _assistant_text(trajectory)
         reward, extracted = verify(str(expected_payload["ground_truth"]), generated)
+
+        # ReTool-style shaping (arXiv:2504.11536), enabled per dataset at
+        # build time via `tool_shaping` in expected_answer.json: only failed
+        # answers earn a per-tool-call bonus, capped below 1.0 so a correct
+        # answer always dominates.
+        raw_reward = reward
+        num_tool_calls = _count_tool_calls(trajectory)
+        shaping = expected_payload.get("tool_shaping")
+        if shaping and reward <= 0.5 and num_tool_calls > 0:
+            reward = min(
+                num_tool_calls * float(shaping["bonus_per_call"]),
+                float(shaping["max_bonus"]),
+            )
+
         details.update(
             {
                 "reward": reward,
+                "raw_reward": raw_reward,
+                "num_tool_calls": num_tool_calls,
                 "extracted_answer": extracted,
                 "dataset": expected_payload.get("dataset"),
                 "source_index": expected_payload.get("source_index"),
@@ -96,6 +121,7 @@ def main() -> int:
         details["error"] = f"{type(exc).__name__}: {exc}"
 
     args.details.write_text(json.dumps(details, ensure_ascii=False, indent=2))
+    args.reward.write_text(f"{details['reward']}\n")
     return 0 if details["reward"] > 0.5 else 1
 
 

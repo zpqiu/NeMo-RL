@@ -102,6 +102,7 @@ def convert_rows(
     jsonl_path: Path,
     seed: int | None,
     resume: bool = False,
+    tool_shaping: dict[str, float] | None = None,
 ) -> ConversionResult:
     templates_dir = Path(__file__).with_name("templates")
     tasks_dir.mkdir(parents=True, exist_ok=resume)
@@ -133,18 +134,20 @@ def convert_rows(
             shutil.copy2(templates_dir / "verify.py", tests_dir / "verify.py")
             (tests_dir / "test.sh").chmod(0o755)
             (tests_dir / "verify.py").chmod(0o755)
+            expected_payload: dict[str, Any] = {
+                "ground_truth": _extract_ground_truth(row),
+                "dataset": dataset_name,
+                "split": split,
+                "source_index": source_index,
+                "reward_style": (row.get("reward_model") or {}).get("style"),
+            }
+            if tool_shaping is not None:
+                # Read by verify.py: ReTool-style bonus for failed answers
+                # that executed tool calls. Build train sets with shaping and
+                # eval sets without so accuracy metrics stay pure.
+                expected_payload["tool_shaping"] = tool_shaping
             (tests_dir / "expected_answer.json").write_text(
-                json.dumps(
-                    {
-                        "ground_truth": _extract_ground_truth(row),
-                        "dataset": dataset_name,
-                        "split": split,
-                        "source_index": source_index,
-                        "reward_style": (row.get("reward_model") or {}).get("style"),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                json.dumps(expected_payload, ensure_ascii=False, indent=2)
             )
         request_rows.append(
             {
@@ -246,6 +249,14 @@ def main() -> None:
     parser.add_argument("--jsonl-path", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--tool-shaping",
+        action="store_true",
+        help="Bake ReTool-style tool-use reward shaping into the tasks "
+        "(failed answers earn a per-tool-call bonus; use for train sets only)",
+    )
+    parser.add_argument("--tool-shaping-bonus", type=float, default=0.1)
+    parser.add_argument("--tool-shaping-cap", type=float, default=0.4)
     args = parser.parse_args()
 
     sif_path = args.sif_path.expanduser().resolve()
@@ -294,6 +305,14 @@ def main() -> None:
         jsonl_path=jsonl_path,
         seed=args.seed,
         resume=args.resume,
+        tool_shaping=(
+            {
+                "bonus_per_call": args.tool_shaping_bonus,
+                "max_bonus": args.tool_shaping_cap,
+            }
+            if args.tool_shaping
+            else None
+        ),
     )
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
 
