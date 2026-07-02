@@ -49,7 +49,10 @@ harbor_agent automatically; sync manually by diffing against the submodule.
 ## Running
 
 ```bash
-# One-time: build the SIF (see docker/), build the Harbor venv
+# One-time: get the runtime SIF — pull the prebuilt aarch64 image
+#     apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
+# (x86 clusters: build from docker/math_code_aarch64.def instead, see docker/).
+# Then build the Harbor venv
 # (responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh with
 # NEMO_GYM_VENV_DIR on shared storage), and prepare the dataset
 # (scripts/prepare_math_code_17k.sh).
