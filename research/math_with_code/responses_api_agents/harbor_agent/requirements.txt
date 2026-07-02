@@ -1,0 +1,4 @@
+# This server dir is an overlay fork living in NeMo-RL's research/ tree; the
+# editable nemo-gym install must point back at the pinned Gym submodule.
+-e nemo-gym[dev] @ ../../../../3rdparty/Gym-workspace/Gym
+harbor @ git+https://github.com/laude-institute/harbor.git@9dddd797b57ab8a0f9d6352a20fce73abbb29573
