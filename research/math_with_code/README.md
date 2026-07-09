@@ -59,8 +59,30 @@ harbor_agent automatically; sync manually by diffing against the submodule.
 
 # Launch training (submits via sbatch + ray.sub from the repo root):
 research/math_with_code/experiments/exp.sh \
-    research/math_with_code/experiments/grpo-math-code-qwen3-8b-async-2x4.sh
+    research/math_with_code/experiments/grpo-math-code-qwen3-8b-async-3x4.sh
 ```
+
+### Cluster prerequisites
+
+- **`/dev/fuse` must be visible inside the training container.** Harbor
+  trials run `singularity exec` on the per-trial SIF from inside the training
+  container; squashfuse needs `/dev/fuse`, and pyxis/enroot does not expose
+  it on every cluster. Symptom: `FATAL: container creation failed: ...
+  squashfuse_ll exited: fuse: device not found`. Fix: add
+  `/dev/fuse:/dev/fuse` to the container mounts of every job — the one-time
+  setup jobs and the ray.sub training job alike.
+- **Run every one-time step on the compute-node architecture.** On clusters
+  with x86 login nodes and aarch64 compute (e.g. GB200), the SIF pull (needs
+  apptainer), the Harbor venv build, and dataset prep (both need the training
+  image's uv) must all run through `srun --container-image=<training sqsh>`
+  on a compute node. The Harbor venv is arch-specific: build it where it will
+  run, on shared storage.
+- **Per-node setup contract**: `scripts/stage_math_code_dataset.sh` and
+  `scripts/preflight_math_with_code_node.sh` read `NEMO_GYM_VENV_DIR`,
+  `MATH_CODE_DATASET_ALIAS`, `MATH_CODE_EXPECTED_TASKS`, and — for
+  non-default paths — `MATH_CODE_TASKS_ARCHIVE`/`MATH_CODE_TASKS_DIR`.
+  Export them in the scheduler wrapper so they reach ray.sub's
+  `SETUP_COMMAND` environment on every node.
 
 `~/.exp_env` must provide `WANDB_API_KEY`, `ACCOUNT`, `MOUNTS`, and optionally
 `CONTAINER`. Results and Slurm logs land under the repo-root `results/` tree.
@@ -76,7 +98,26 @@ from the repo root.
 ## Data
 
 Nothing under `responses_api_agents/harbor_agent/data/` is committed — the
-directory is fully gitignored. Datasets come from two places:
+directory is fully gitignored.
+
+The data model has two layers that must stay consistent:
+
+- The **request JSONL** (`data.train.data_path` in the training config) is
+  only the index NeMo-RL's dataloader iterates; each row references a task in
+  one of the agent's `harbor_datasets`.
+- The **task tree** (one directory per task: `instruction.md`, `task.toml`,
+  `tests/`, `environment/`) is what Harbor actually executes. Train-scale
+  trees are inode-heavy (~8 inodes/task), so they ship as a single `tar.gz`
+  on shared storage and are extracted onto node-local disk
+  (`/tmp/nemo_rl_math_code/<alias>`) by `scripts/stage_math_code_dataset.sh`
+  on every node before Ray starts. Small eval sets (AIME: 30 tasks) skip the
+  archive and live directly on shared storage.
+- The dataset **alias** ties the layers together: it must match the
+  `harbor_datasets` key in `configs/math_code_harbor_agent.yaml` (whose
+  `local_dataset_path` points at the staged path), the archive filename, and
+  the JSONL filename in `data.train.data_path`.
+
+Datasets come from two places:
 
 - **Filtered train source** (6389 DAPO prompts Qwen3-8B did not solve 8/8):
   published as
@@ -106,6 +147,21 @@ MATH_CODE_TOOL_SHAPING=1 \
 tasks (failed answers earn 0.1 per executed tool call, capped at 0.4; see
 `math_code/templates/verify.py`). Use it for train sets only, so eval accuracy
 stays a pure correctness metric.
+
+Rebuild the AIME 2024 eval set (30 boxed tasks from
+[tongyx361/AIME-2024-Boxed](https://huggingface.co/datasets/tongyx361/AIME-2024-Boxed);
+no staging archive, no tool shaping — run from this project directory):
+
+```bash
+uv run python responses_api_agents/harbor_agent/math_code/prepare_dataset.py \
+    --dataset tongyx361/AIME-2024-Boxed \
+    --dataset-alias aime_2024 \
+    --split train \
+    --sif-path "$MATH_CODE_SIF_PATH" \
+    --tasks-dir responses_api_agents/harbor_agent/data/math_code/aime_2024 \
+    --jsonl-path responses_api_agents/harbor_agent/data/math_code/aime_2024.jsonl \
+    --overwrite
+```
 
 Harbor trial outputs land in `responses_api_agents/harbor_agent/jobs/`
 (gitignored). Successful trials are deleted automatically; failed ones are kept
