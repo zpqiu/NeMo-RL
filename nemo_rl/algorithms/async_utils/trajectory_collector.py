@@ -140,6 +140,9 @@ class AsyncTrajectoryCollector:
         self._failure_lock: _threading.Lock = _threading.Lock()
         self._fatal_error: Optional[str] = None
         self._collection_exhausted = False
+        # Completed passes over the dataloader. Seeded from the checkpoint's
+        # current_epoch on resume so grpo.max_num_epochs holds across restarts.
+        self._dataloader_epoch = 0
 
     def _record_failure(self, context: str, exc: BaseException) -> None:
         detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -167,9 +170,10 @@ class AsyncTrajectoryCollector:
             pending_count = sum(t.is_alive() for t in self._inflight_threads)
         if self._collection_exhausted and pending_count == 0:
             raise RuntimeError(
-                "Async trajectory collection exhausted its dataloader before "
-                "the replay buffer could form the requested training batch. "
-                "Reduce grpo.max_num_steps or provide/repeat enough training data."
+                "Async trajectory collection exhausted its dataloader "
+                f"(after {self._dataloader_epoch} epochs) before the replay "
+                "buffer could form the requested training batch. Reduce "
+                "grpo.max_num_steps or raise grpo.max_num_epochs."
             )
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
@@ -286,10 +290,21 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
-        """Start collecting trajectories from dataloader."""
+    def start_collection(
+        self, dataloader: StatefulDataLoader, start_epoch: int = 0
+    ) -> None:
+        """Start collecting trajectories from dataloader.
+
+        Args:
+            dataloader: Source of prompt batches. Re-iterated once per epoch up
+                to ``grpo.max_num_epochs`` total passes, matching sync GRPO.
+            start_epoch: Number of dataloader passes already completed (from the
+                checkpoint's ``current_epoch``) so resumes don't reset the
+                epoch budget.
+        """
         self.running = True
         self.dataloader = dataloader
+        self._dataloader_epoch = start_epoch
 
         print("Started continuous trajectory collection")
 
@@ -300,52 +315,24 @@ class AsyncTrajectoryCollector:
         print("Collection thread started, start_collection returning")
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
+        """Run the collection loop in background thread.
+
+        Iterates the dataloader for up to ``grpo.max_num_epochs`` passes
+        (mirroring the sync GRPO epoch loop) before declaring collection
+        exhausted. A resumed run continues from the checkpointed epoch.
+        """
         try:
-            for batch in self.dataloader:
+            max_num_epochs = int(self.master_config.grpo["max_num_epochs"])
+            while self.running and self._dataloader_epoch < max_num_epochs:
+                self._run_dataloader_epoch()
                 if not self.running:
                     break
-
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
-
-                if not self.running:
-                    break
-
-                self._process_batch(batch)
+                self._dataloader_epoch += 1
+                if self._dataloader_epoch < max_num_epochs:
+                    print(
+                        f"🔁 Dataloader pass {self._dataloader_epoch} complete; "
+                        f"starting epoch {self._dataloader_epoch + 1}/{max_num_epochs}"
+                    )
 
             if self.running:
                 self._collection_exhausted = True
@@ -357,6 +344,53 @@ class AsyncTrajectoryCollector:
         finally:
             self.running = False
             print("🛑 Trajectory collection stopped")
+
+    def _run_dataloader_epoch(self) -> None:
+        """Consume one full pass of the dataloader, honoring pause signals."""
+        for batch in self.dataloader:
+            if not self.running:
+                break
+
+            # Check if manually paused and wait
+            if not self._manual_pause_cleared.is_set() and self.running:
+                self._manual_pause_cleared.wait()
+
+            # Check if refit is in progress and wait
+            if not self._refit_pause_cleared.is_set() and self.running:
+                print("⏸️ Pausing collection for refit...")
+                self._refit_pause_cleared.wait()
+                print("▶️ Refit completed, resuming collection")
+
+            # Check if generation limits require pausing collection
+            if self._should_pause_for_generation_limits() and self.running:
+                # Only log warning once per weight version
+                if self._last_limit_warning_version != self.current_weight_version:
+                    async_cfg = self.master_config.grpo.get("async_grpo", {})
+                    max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                    target_weights = [
+                        self.current_weight_version + i
+                        for i in range(max_trajectory_age)
+                    ]
+
+                    print(
+                        f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                        f"already exist in buffer. Waiting for weight update..."
+                    )
+                    self._last_limit_warning_version = self.current_weight_version
+
+                    self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                # Efficiently wait for generation limits to be cleared (no polling!)
+                self._generation_limit_cleared.wait()
+
+                # Double-check we're still running after being woken up
+                if not self.running:
+                    break
+
+            if not self.running:
+                break
+
+            self._process_batch(batch)
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -646,6 +680,10 @@ class AsyncTrajectoryCollector:
         if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
+
+    def get_dataloader_epoch(self) -> int:
+        """Number of completed dataloader passes, for checkpointing."""
+        return self._dataloader_epoch
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:

@@ -1103,6 +1103,7 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
+                "max_num_epochs": 1,
                 "async_grpo": {"max_trajectory_age_steps": 2},
             },
             "policy": {
@@ -1130,6 +1131,42 @@ class TestAsyncTrajectoryCollector:
                 "loss_multiplier": torch.ones(size),
             }
         )
+
+    def test_collection_loop_repeats_dataloader_for_max_num_epochs(self):
+        """The collector re-iterates its dataloader once per configured epoch."""
+        collector = self.create_local_collector()
+        collector.master_config.grpo["max_num_epochs"] = 3
+        collector.running = True
+        collector.dataloader = [self.create_mock_batch(), self.create_mock_batch()]
+        collector._process_batch = mock.MagicMock()
+        collector._should_pause_for_generation_limits = mock.MagicMock(
+            return_value=False
+        )
+
+        collector._collection_loop()
+
+        assert collector._process_batch.call_count == 2 * 3
+        assert collector.get_dataloader_epoch() == 3
+        assert collector._collection_exhausted
+        assert not collector.running
+
+    def test_collection_loop_resumes_from_checkpointed_epoch(self):
+        """A resumed collector only consumes the remaining epoch budget."""
+        collector = self.create_local_collector()
+        collector.master_config.grpo["max_num_epochs"] = 3
+        collector.running = True
+        collector.dataloader = [self.create_mock_batch()]
+        collector._dataloader_epoch = 2
+        collector._process_batch = mock.MagicMock()
+        collector._should_pause_for_generation_limits = mock.MagicMock(
+            return_value=False
+        )
+
+        collector._collection_loop()
+
+        assert collector._process_batch.call_count == 1
+        assert collector.get_dataloader_epoch() == 3
+        assert collector._collection_exhausted
 
     def test_async_trajectory_collector_initialization(self):
         """Test AsyncTrajectoryCollector initialization."""

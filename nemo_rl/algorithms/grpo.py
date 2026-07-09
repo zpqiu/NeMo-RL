@@ -3528,8 +3528,12 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
+    # Start trajectory collection in background. Seed the completed-epoch count
+    # from the checkpoint so grpo.max_num_epochs holds across resumes.
+    # (.get: async checkpoints written before epoch support lack the key.)
+    collection_task = trajectory_collector.start_collection.remote(
+        dataloader, start_epoch=grpo_save_state.get("current_epoch", 0)
+    )
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
@@ -4140,6 +4144,9 @@ def async_grpo_train(
                     elif "val_reward" in grpo_save_state:
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
+                    grpo_save_state["current_epoch"] = ray.get(
+                        trajectory_collector.get_dataloader_epoch.remote()
+                    )
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
