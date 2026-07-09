@@ -137,6 +137,16 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # trainable token details remain in response.output.
     harbor_compact_metadata: bool = False
 
+    # --- ReTool-style tool-use shaping (arXiv:2504.11536) ---
+    # Among FAILED rollouts only, add bonus_per_call per executed tool call,
+    # capped below 1.0 so a correct answer always dominates. Within a GRPO
+    # group this breaks reward ties on all-fail prompts and points the
+    # advantage toward tool use. Applied only to the listed dataset aliases so
+    # validation accuracy stays a pure correctness metric.
+    harbor_tool_shaping_dataset_aliases: list[str] = []
+    harbor_tool_shaping_bonus_per_call: float = 0.1
+    harbor_tool_shaping_max_bonus: float = 0.4
+
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
     model_server: ModelServerRef
@@ -149,6 +159,22 @@ class HarborRunRequest(BaseRunRequest):
 
 class HarborVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+
+    # Numeric fields are auto-aggregated into per-agent W&B metrics by NeMo-RL
+    # (train/<agent>/raw_reward/mean, ...), so true correctness and tool-call
+    # counts stay observable when `reward` carries the shaped value.
+    raw_reward: float = 0.0
+    num_tool_calls: int = 0
+    # Pure rollout-speed metrics from the agent's wall-clock split (see
+    # MathCodeHarborAgent._write_perf_metrics). model_generation_sec covers
+    # only the model HTTP calls — tool execution is measured separately — so
+    # gen_tokens_per_model_sec is a clean per-stream decode-rate for comparing
+    # rollout-acceleration changes (FP8, cudagraphs, ...) across runs.
+    model_generation_sec: float = 0.0
+    tool_exec_sec: float = 0.0
+    num_model_calls: int = 0
+    generated_tokens: int = 0
+    gen_tokens_per_model_sec: float = 0.0
 
 
 async def run_harbor_job(job_config_dict: dict) -> str:
@@ -358,6 +384,12 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     with open(agent_error_flags_path, "r") as f:
                         agent_error_flags = json.load(f)
 
+                agent_perf = {}
+                agent_perf_path = trial_dir / "agent" / "agent_perf.json"
+                if agent_perf_path.exists():
+                    with open(agent_perf_path, "r") as f:
+                        agent_perf = json.load(f)
+
                 # Extract reward from verifier result
                 verifier_result = trial_result.get("verifier_result")
                 reward = HarborAgentUtils.extract_reward(verifier_result)
@@ -385,11 +417,33 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 trial_result = None
                 trajectory = None
                 agent_error_flags = {}
+                agent_perf = {}
                 output_items = []
                 input_messages = []
                 tool_definitions = []
                 usage = None
                 reward = 0.0
+
+            num_tool_calls = sum(
+                1 for item in output_items if item.get("type") == "function_call"
+            )
+            raw_reward = reward
+            # Legacy path for task trees whose baked verify.py predates the
+            # in-verifier shaping: those emit strictly binary rewards, so
+            # shaping only exact-0 failures makes the two layers mutually
+            # exclusive — a verifier-shaped failure arrives in (0, 1) and is
+            # passed through untouched. The cap keeps every shaped failure
+            # strictly below a correct answer.
+            if (
+                dataset_alias in self.config.harbor_tool_shaping_dataset_aliases
+                and reward == 0.0
+                and num_tool_calls > 0
+            ):
+                reward = min(
+                    reward
+                    + self.config.harbor_tool_shaping_bonus_per_call * num_tool_calls,
+                    self.config.harbor_tool_shaping_max_bonus,
+                )
 
             response = HarborAgentUtils.get_default_response_object()
             response["model"] = policy_model_name
@@ -417,9 +471,22 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 if self.config.harbor_compact_metadata
                 else trial_result
             )
+            model_generation_sec = float(agent_perf.get("model_generation_sec", 0.0))
+            generated_tokens = int(agent_perf.get("generated_tokens", 0))
             verify_response = HarborVerifyResponse(
                 responses_create_params=updated_params,
                 reward=reward,
+                raw_reward=raw_reward,
+                num_tool_calls=num_tool_calls,
+                model_generation_sec=model_generation_sec,
+                tool_exec_sec=float(agent_perf.get("tool_exec_sec", 0.0)),
+                num_model_calls=int(agent_perf.get("num_model_calls", 0)),
+                generated_tokens=generated_tokens,
+                gen_tokens_per_model_sec=(
+                    generated_tokens / model_generation_sec
+                    if model_generation_sec > 0
+                    else 0.0
+                ),
                 response=response,
                 instance_id=instance_id,
                 metadata=metadata if metadata else {},

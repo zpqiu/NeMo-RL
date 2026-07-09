@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import shlex
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,11 @@ class MathCodeHarborAgent(BaseAgent):
         self._turn_metrics: list[Metrics] = []
         self._run_error: str | None = None
         self._context_length_exceeded = False
+        # Wall-clock split between model generation and tool execution, used
+        # for clean rollout-speed metrics (e.g. FP8 A/B) that exclude tool time.
+        self._model_call_sec = 0.0
+        self._model_call_count = 0
+        self._tool_exec_sec = 0.0
 
     @staticmethod
     def name() -> str:
@@ -164,6 +170,9 @@ class MathCodeHarborAgent(BaseAgent):
         self._turn_metrics = []
         self._run_error = None
         self._context_length_exceeded = False
+        self._model_call_sec = 0.0
+        self._model_call_count = 0
+        self._tool_exec_sec = 0.0
         generated_items: list[dict[str, Any]] = []
         initial_input = [
             {"type": "message", "role": "system", "content": self._system_prompt},
@@ -198,7 +207,9 @@ class MathCodeHarborAgent(BaseAgent):
 
                     observations: list[ObservationResult] = []
                     for function_call in function_calls:
+                        tool_started = time.monotonic()
                         tool_output, parsed_arguments = await self._execute_tool_call(environment, function_call)
+                        self._tool_exec_sec += time.monotonic() - tool_started
                         generated_items.append(
                             {
                                 "type": "function_call_output",
@@ -226,6 +237,7 @@ class MathCodeHarborAgent(BaseAgent):
             self._write_trajectory(session_id)
             self._populate_context(context)
             self._write_error_flags()
+            self._write_perf_metrics()
 
     def _build_model_body(self, inputs: list[dict[str, Any]]) -> NeMoGymResponseCreateParamsNonStreaming:
         params = dict(self._responses_create_params)
@@ -252,15 +264,44 @@ class MathCodeHarborAgent(BaseAgent):
         )
         return NeMoGymResponseCreateParamsNonStreaming.model_validate(params)
 
+    # Connection-level failures are transient under high rollout concurrency
+    # (uvicorn accept backlog / keepalive drops). Timeouts are excluded: the
+    # request is genuinely slow, and re-issuing it would blow the agent-phase
+    # budget and amplify server load.
+    _RETRYABLE_MODEL_ERRORS = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.RemoteProtocolError,
+    )
+    _MODEL_CALL_ATTEMPTS = 3
+
     async def _call_model(
         self,
         client: httpx.AsyncClient,
         body: NeMoGymResponseCreateParamsNonStreaming,
     ) -> NeMoGymResponse:
-        response = await client.post(
-            f"{self._api_base}/responses",
-            json=body.model_dump(exclude_none=True, exclude_unset=True),
-        )
+        payload = body.model_dump(exclude_none=True, exclude_unset=True)
+        # Retry sleeps are excluded from the generation-time metric; the
+        # server-side wait for a slow response is what we want to measure.
+        for attempt in range(1, self._MODEL_CALL_ATTEMPTS + 1):
+            call_started = time.monotonic()
+            try:
+                response = await client.post(f"{self._api_base}/responses", json=payload)
+                self._model_call_sec += time.monotonic() - call_started
+                self._model_call_count += 1
+                break
+            except self._RETRYABLE_MODEL_ERRORS as exc:
+                if attempt == self._MODEL_CALL_ATTEMPTS:
+                    raise
+                self.logger.warning(
+                    "Transient model call failure (%r), retrying %d/%d",
+                    exc,
+                    attempt,
+                    self._MODEL_CALL_ATTEMPTS - 1,
+                )
+                await asyncio.sleep(2**attempt)
         response.raise_for_status()
         try:
             return NeMoGymResponse.model_validate(response.json())
@@ -463,3 +504,21 @@ class MathCodeHarborAgent(BaseAgent):
             "run_error": self._run_error,
         }
         (self.logs_dir / "agent_error_flags.json").write_text(json.dumps(flags, ensure_ascii=False, indent=2))
+
+    def _write_perf_metrics(self) -> None:
+        """Persist the model/tool wall-clock split for rollout-speed metrics.
+
+        app.py surfaces these as numeric fields on the verify response, which
+        NeMo-RL auto-aggregates into per-agent W&B metrics. ``generated_tokens``
+        comes from per-turn usage, so tokens/sec over ``model_generation_sec``
+        measures pure generation throughput, excluding tool execution.
+        """
+        perf = {
+            "model_generation_sec": round(self._model_call_sec, 3),
+            "num_model_calls": self._model_call_count,
+            "tool_exec_sec": round(self._tool_exec_sec, 3),
+            "generated_tokens": sum(
+                m.completion_tokens or 0 for m in self._turn_metrics
+            ),
+        }
+        (self.logs_dir / "agent_perf.json").write_text(json.dumps(perf, ensure_ascii=False, indent=2))
