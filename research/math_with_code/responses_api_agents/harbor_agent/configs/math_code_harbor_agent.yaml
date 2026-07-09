@@ -1,0 +1,94 @@
+math_code_harbor_agent:
+  responses_api_agents:
+    harbor_agent:
+      entrypoint: app.py
+      domain: agent
+      description: Harbor math agent with a persistent per-trial Python tool.
+      value: Train mathematical reasoning with isolated code execution and boxed-answer grading.
+
+      # This bounds the number of live Harbor trials/SIF servers per Gym agent
+      # process. NeMo-RL may submit more requests; the remainder wait here.
+      # Sizing: ~16 concurrent seqs per vLLM replica keeps per-call latency
+      # within model_timeout_sec=180. 256 on 4 replicas (job 3870671) drove
+      # calls past the timeout and vLLM into disconnects, killing the run.
+      # 128 assumes 8 replicas (2 gen nodes); on 1 gen node also raise the
+      # model/agent/job timeouts or drop back to 64.
+      concurrency: 128
+
+      harbor_datasets:
+        dapo_math_17k:
+          # Staged from one shared archive onto every Ray node before startup.
+          local_dataset_path: /tmp/nemo_rl_math_code/dapo_math_17k
+          workdir: /app
+        dapo_math_17k_non8:
+          # Rebuilt from the published filtered subset; see README Data section.
+          local_dataset_path: /tmp/nemo_rl_math_code/dapo_math_17k_non8
+          workdir: /app
+        dapo_math_1k:
+          # Agent servers run with responses_api_agents/harbor_agent as cwd.
+          # app.py resolves this to a shared absolute path before the Ray job.
+          local_dataset_path: data/math_code/dapo_math_1k
+          workdir: /app
+        aime_2024:
+          local_dataset_path: data/math_code/aime_2024
+          workdir: /app
+
+      harbor_agent_name: null
+      harbor_agent_import_path: responses_api_agents.harbor_agent.custom_agents.math_code_harbor_agent:MathCodeHarborAgent
+      harbor_agent_kwargs:
+        max_steps: 4
+        code_timeout_sec: 10
+        # Additional address-space budget available to generated Python code
+        # after NumPy/SciPy/Pandas are preloaded in the persistent worker.
+        code_memory_limit_mb: 1024
+        # Sized for concurrency=128 on 4 vLLM replicas (32 seqs/replica): per-seq
+        # decode is ~2x slower than the 64-slot regime that fit under 180s.
+        # Job 3874965: 180s ReadTimeouts on first model calls killed the run.
+        model_timeout_sec: 360.0
+        # Per-tool-call character cap before stdout/stderr is added to model context.
+        max_tool_output_chars: 4000
+        max_code_chars: 100000
+        collect_rollout_details: true
+
+      harbor_environment_type: null
+      harbor_environment_import_path: responses_api_agents.harbor_agent.custom_envs.singularity.singularity:SingularityEnvironment
+      harbor_environment_kwargs:
+        singularity_image_cache_dir: singularity_cache
+
+      model_server:
+        type: responses_api_models
+        name: policy_model
+
+      # Whole-trial budget scaled with model_timeout_sec for the 128-slot regime.
+      harbor_agent_override_timeout: 480
+      harbor_agent_max_timeout: null
+      harbor_verifier_override_timeout: 30
+      harbor_verifier_max_timeout: null
+      harbor_timeout_multiplier: 1.0
+      # Last-resort guard above the 480s agent + 30s verifier phase limits.
+      harbor_job_timeout_sec: 600
+      # Fire inside the Ray worker first so Harbor can clean up its SIF/session.
+      harbor_job_cooperative_timeout_sec: 570
+      # Queue wait is separate from the per-job watchdog. Bound it so overload
+      # becomes a visible failure rather than an unbounded collect stall.
+      # Must exceed (submitted/concurrency - 1) x max trial time: with 2x
+      # oversubscription and ~510s phase budgets the tail can wait ~600s
+      # legitimately (observed p99 563s in the B64G16 run), so 600 was fatal.
+      harbor_request_queue_timeout_sec: 1200
+      harbor_raise_on_job_error: true
+      harbor_validate_training_tokens: true
+
+      # Legacy ReTool-style shaping for task archives built BEFORE in-verifier
+      # shaping existed (canonical path: MATH_CODE_TOOL_SHAPING=1 at dataset
+      # build time; see README). Failed dapo rollouts earn 0.1 per executed
+      # tool call, capped at 0.4. Only exact-0 rewards are shaped, so this
+      # never stacks with verifier-shaped tasks. aime_2024 is excluded:
+      # validation stays pure accuracy.
+      harbor_tool_shaping_dataset_aliases: [dapo_math_17k]
+
+      harbor_jobs_dir: jobs/math_code
+      # Production RL keeps failures for diagnosis but removes healthy trial
+      # trees and duplicate response copies to protect shared-fs inodes.
+      harbor_save_response_json: false
+      harbor_retain_successful_jobs: false
+      harbor_compact_metadata: true

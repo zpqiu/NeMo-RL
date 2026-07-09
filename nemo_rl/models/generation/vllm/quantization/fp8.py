@@ -464,7 +464,7 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     assert layer.weight_block_size is not None
 
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        deepgemm_post_process_fp8_weight_block,
+        requant_weight_ue8m0_inplace,
     )
     from vllm.utils.deep_gemm import (
         is_deep_gemm_e8m0_used,
@@ -477,17 +477,21 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
         layer.orig_dtype, layer.weight.shape
     )
-    if should_use_deepgemm:
-        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
-            wq=layer.weight.data,
-            ws=layer.weight_scale.data,
-            quant_block_shape=tuple(layer.weight_block_size),
-            use_e8m0=is_deep_gemm_e8m0_used(),
+    if should_use_deepgemm and is_deep_gemm_e8m0_used():
+        # Unlike vLLM's deepgemm_post_process_fp8_weight_block, requantize in
+        # place and skip transform_sf_into_required_layout: on SM100 that
+        # transform packs the (N/128, K/128) fp32 scales into DeepGEMM's
+        # int32 UE8M0 layout (K packed by 4), which cannot be copy_()'d back
+        # into the fp32 scale parameter that refit weight loaders write into.
+        # DeepGEMM repacks fp32 power-of-two scales at dispatch, so the fp32
+        # layout stays valid on both Hopper and Blackwell. When E8M0 is off,
+        # the vLLM helper is a shape-preserving no-op for 2D linear weights
+        # (no requant, pass-through transform), so skipping it is equivalent.
+        requant_weight_ue8m0_inplace(
+            layer.weight.data,
+            layer.weight_scale.data,
+            tuple(layer.weight_block_size),
         )
-        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
-        # Instead of creating new torch.nn.Parameter, we update the data in place.
-        layer.weight.data.copy_(dg_weight)
-        layer.weight_scale.data.copy_(dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:

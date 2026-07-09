@@ -139,6 +139,9 @@ class AsyncGRPOConfig(TypedDict):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int
+    # Maximum number of prompt groups concurrently submitted for generation.
+    # If omitted, preserve the legacy limit derived from the step batch size.
+    max_inflight_prompt_groups: NotRequired[int]
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: NotRequired[bool]
@@ -3533,8 +3536,12 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
+    # Start trajectory collection in background. Seed the completed-epoch count
+    # from the checkpoint so grpo.max_num_epochs holds across resumes.
+    # (.get: async checkpoints written before epoch support lack the key.)
+    collection_task = trajectory_collector.start_collection.remote(
+        dataloader, start_epoch=grpo_save_state.get("current_epoch", 0)
+    )
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
@@ -3576,7 +3583,7 @@ def async_grpo_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         # Pause trajectory collection during initial validation
-        trajectory_collector.pause.remote()
+        ray.get(trajectory_collector.pause.remote(drain=True))
 
         try:
             val_metrics, validation_timings = validate(
@@ -3625,8 +3632,15 @@ def async_grpo_train(
             f"step {step} ready={current_step_ready}"
         )
 
+        ray.get(trajectory_collector.raise_if_failed.remote())
         if current_step_ready:
             break
+
+        # Background collector threads cannot propagate exceptions through the
+        # start_collection ObjectRef. Check their explicit health channel while
+        # waiting so a failed rollout is reported instead of looking like a
+        # permanently empty replay buffer.
+        ray.get(trajectory_collector.raise_if_unable_to_progress.remote())
 
         trajectories_needed = ray.get(
             replay_buffer.get_trajectories_needed.remote(
@@ -3655,6 +3669,7 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                ray.get(trajectory_collector.raise_if_failed.remote())
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -3680,6 +3695,9 @@ def async_grpo_train(
                         or len(sample_result["trajectories"])
                         != num_prompt_groups_needed
                     ):
+                        ray.get(
+                            trajectory_collector.raise_if_unable_to_progress.remote()
+                        )
                         print(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
                         )
@@ -4011,7 +4029,7 @@ def async_grpo_train(
                     val_at_end and is_last_step
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    ray.get(trajectory_collector.pause.remote(drain=True))
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -4134,6 +4152,9 @@ def async_grpo_train(
                     elif "val_reward" in grpo_save_state:
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
+                    grpo_save_state["current_epoch"] = ray.get(
+                        trajectory_collector.get_dataloader_epoch.remote()
+                    )
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -4322,6 +4343,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Clean up
@@ -4365,4 +4387,4 @@ def async_grpo_train(
             except Exception as e:
                 print(f"Error shutting down policy workers: {e}")
 
-        print("Async GRPO training complete!")
+        print("Async GRPO shutdown complete")

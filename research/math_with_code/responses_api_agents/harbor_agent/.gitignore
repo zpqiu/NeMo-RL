@@ -1,0 +1,6 @@
+# Runtime outputs and datasets stay out of git entirely. Datasets rebuild from
+# scripts or download from Hugging Face; see the project README's Data section.
+data/
+jobs/
+results/
+singularity_cache/

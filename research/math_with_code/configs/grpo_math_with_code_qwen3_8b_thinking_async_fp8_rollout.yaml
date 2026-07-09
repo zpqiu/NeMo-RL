@@ -1,0 +1,35 @@
+# FP8-rollout A/B against grpo_math_with_code_qwen3_8b_thinking_async.yaml.
+# vLLM generation runs DeepSeek-style block-wise FP8 (128x128 weight blocks,
+# per-token-group activations) through DeepGEMM; dtensor training, logprob
+# recomputation, and the KV cache stay bfloat16 — any curve difference vs the
+# BF16 baseline isolates rollout GEMM precision.
+defaults: grpo_math_with_code_qwen3_8b_thinking_async.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      # GB200 (SM100): DeepGEMM's SM100 FP8 kernels only accept packed UE8M0
+      # (power-of-two) scales; FP32 scales abort at dispatch with "Unsupported
+      # architecture or scaling factor types". NeMo-RL's use_deep_gemm flag
+      # implements the Hopper recipe — init_fp8 exports
+      # VLLM_USE_DEEP_GEMM_E8M0=0 inside the worker when it is true
+      # (nemo_rl/models/generation/vllm/quantization/fp8.py) — so it must stay
+      # false here. DeepGEMM+UE8M0 is pinned via vLLM's own env vars instead.
+      use_deep_gemm: false
+      env_vars:
+        VLLM_USE_DEEP_GEMM: "1"
+        VLLM_USE_DEEP_GEMM_E8M0: "1"
+      # Quantize refit weights straight to power-of-two scales so vLLM's
+      # DeepGEMM post-load UE8M0 requant is idempotent instead of a second
+      # lossy quantization after every weight sync.
+      pow2_weight_scaling_factors: true
+      # Activations are quantized once at runtime by vLLM, already with UE8M0
+      # scales when E8M0 is enabled; the NeMo-RL activation pow2 patch is
+      # redundant on this path.
+      pow2_activation_scaling_factors: false
+      # kv_cache_dtype stays "auto" (bf16) from the baseline: FP8 GEMMs only.
+
+logger:
+  wandb:
+    name: "qwen3-8b-thinking-mathcode-async-fp8-rollout"
