@@ -28,6 +28,7 @@ test -f "$SESSION_SCRIPT"
 python3 "$SESSION_SCRIPT" serve \
     --socket "$SESSION_SOCKET" \
     --timeout-sec 3 \
+    --memory-limit-mb 1024 \
     >"$SESSION_LOG" 2>&1 &
 session_pid=$!
 trap 'kill "$session_pid" 2>/dev/null || true' EXIT
