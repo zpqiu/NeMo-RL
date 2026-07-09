@@ -1,15 +1,16 @@
 # Async GRPO on Harbor math-code tasks with Qwen3-8B.
 # Multi-turn is handled by MathCodeHarborAgent inside an isolated per-trial SIF.
-# Async = 1-step off-policy via grpo.async_grpo. Dense 8B on dtensor (FSDP2), 2 nodes x 4 GPU.
+# Async = 1-step off-policy via grpo.async_grpo. Dense 8B on dtensor (FSDP2),
+# 3 nodes x 4 GPU: 2 generation (8 vLLM replicas) + 1 training.
 grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
   max_rollout_turns: 1   # gym manages its own internal tool-call steps; NeMo-RL sees one rollout
   max_num_epochs: 100
-  # Async collection currently consumes this finite dataloader once; the non8
-  # train set has 6389 prompts = 199 full 32-prompt batches. Stop with margin
-  # so the run ends cleanly instead of tripping the exhaustion guard.
-  max_num_steps: 195
+  # Async collection re-iterates the dataloader for up to max_num_epochs
+  # passes (like sync GRPO), so max_num_steps may exceed one epoch: the non8
+  # train set has 6389 prompts = 199 full 32-prompt batches per epoch.
+  max_num_steps: 100000
   normalize_rewards: true
   use_leave_one_out_baseline: false
   val_period: 10
@@ -30,6 +31,10 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    # Sizing rule: inflight * num_generations_per_prompt should stay ~2x the
+    # Harbor agent `concurrency` (128). At 32 groups x 16 gens = 512 requests,
+    # semaphore queue waits blew past harbor_request_queue_timeout_sec (job
+    # 3929304); 16 x 16 = 256 keeps the slots saturated at the proven depth.
     max_inflight_prompt_groups: 16
     # Keep a multi-call Harbor trajectory on one model version for the first
     # correctness run. Re-enable overlap only after the 16x8 soak is clean.
@@ -42,12 +47,15 @@ loss_fn:
   kl_input_clamp_value: 20.0
   kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
-  ratio_clip_c: null
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
   use_on_policy_kl_approximation: false
   # Async GRPO requires importance sampling correction enabled
   use_importance_sampling_correction: true
-  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
   token_level_loss: true
 
 checkpointing:
@@ -67,9 +75,9 @@ policy:
     chat_template_kwargs:
       enable_thinking: true
   hf_config_overrides: {}
-  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
+  train_global_batch_size: 512
+  train_micro_batch_size: 2
+  logprob_batch_size: 2
   generation_batch_size: 32  # HF backend only; Harbor concurrency is configured separately
   max_total_sequence_length: 20480
   precision: "bfloat16"
@@ -147,7 +155,7 @@ policy:
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false   # cudagraphs on (faster decode); enforce_eager did not affect the hang
       use_deep_gemm: false
@@ -253,12 +261,16 @@ policy:
       compilation_config:
         backend: eager
     colocated:
-      # Async GRPO requires non-colocated inference: dedicate 1 node (4 GPUs) to vLLM
-      # generation; the remaining node (4 GPUs) runs dtensor training.
+      # Async GRPO requires non-colocated inference: dedicate 2 nodes (8 GPUs) to
+      # vLLM generation; the remaining node (4 GPUs) runs dtensor training.
+      # Sized for B64G16: gen wall was 1186s vs train 722s on 1 gen node, so 2
+      # gen nodes rebalance to ~750s per step. 8 single-GPU replicas at Harbor
+      # concurrency=128 is 16 seqs/replica — the proven low-latency regime, so
+      # the scaled trial timeouts keep extra headroom.
       enabled: false
       resources:
         gpus_per_node: 4   # must equal cluster.gpus_per_node for non-colocated multi-node
-        num_nodes: 1       # 1 node dedicated to vLLM generation; the other runs training
+        num_nodes: 2       # 2 nodes dedicated to vLLM generation; the third runs training
 
 data:
   max_input_seq_length: null
@@ -273,7 +285,7 @@ data:
     data_path: research/math_with_code/responses_api_agents/harbor_agent/data/math_code/aime_2024.jsonl
     # NeMo-Gym validation performs one rollout per dataset row. Repeat the
     # 30 AIME tasks in-memory to report mean accuracy over 4 samples/task.
-    repeat: 4
+    repeat: 16
   default:
     dataset_name: NemoGymDataset
     env_name: "nemo_gym"
@@ -337,7 +349,7 @@ logger:
 
 cluster:
   gpus_per_node: 4
-  num_nodes: 2
+  num_nodes: 3
   master_port_range_low: 25000
   master_port_range_high: 28000
   segment_size: null
