@@ -713,8 +713,13 @@ class SingularityEnvironment(BaseEnvironment):
 
             # First, try graceful termination
             # Singularity should propagate SIGTERM to container processes
-            self._server_process.terminate()
-            self.logger.debug(f"Sent SIGTERM to Singularity process {pid}")
+            try:
+                self._server_process.terminate()
+                self.logger.debug(f"Sent SIGTERM to Singularity process {pid}")
+            except ProcessLookupError:
+                # Exited between the returncode check and the signal; the
+                # process is already gone, which is what stop() wants.
+                pass
 
             # Wait for graceful shutdown
             try:
@@ -722,7 +727,14 @@ class SingularityEnvironment(BaseEnvironment):
             except asyncio.TimeoutError:
                 # Force kill
                 self.logger.debug("Graceful shutdown timed out, force killing")
-                self._server_process.kill()
+                try:
+                    self._server_process.kill()
+                except ProcessLookupError:
+                    # Exited during the grace window, right before the kill.
+                    # Harbor records exceptions raised here as trial failures
+                    # even after a successful verify, so a dead process must
+                    # not be treated as an error.
+                    pass
                 await self._server_process.wait()
 
             # Run pkill as a backup to catch any escaped child processes
