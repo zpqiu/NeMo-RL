@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Most users should NOT run this: pull the prebuilt aarch64 image instead —
+#     apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
+# Build only when changing math_code_aarch64.def or targeting another arch.
 #SBATCH --job-name=math-code-sif
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

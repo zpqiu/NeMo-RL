@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Build and smoke-test the math-code SIF from inside the NeMo-RL sqsh.
+#
+# Most users should NOT run this: pull the prebuilt aarch64 image instead —
+#     apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
+# Build only when changing math_code_aarch64.def or targeting another arch.
 set -euo pipefail
 
 : "${SIF_OUT:?Set SIF_OUT to the persistent output .sif path}"
