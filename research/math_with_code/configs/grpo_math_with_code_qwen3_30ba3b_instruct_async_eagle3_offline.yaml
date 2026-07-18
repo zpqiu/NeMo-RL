@@ -1,0 +1,30 @@
+# EAGLE-3 track, Phase 1: OFFLINE drafter, val-burst measurement only.
+# Identical operating point to the BF16 async base; the only change is vLLM
+# speculative decoding with a fixed (not RL-trained) eagle3 drafter. Run under
+# NRL_SKIP_REFIT=1 like the FP8 bring-up windows: val-at-start readout is the
+# experiment; do not chain training steps from these windows.
+#
+# Purpose is CALIBRATION, not go/no-go: published eagle3 numbers are batch=1 /
+# near-greedy; our operating point is temp=1.0, ~64 streams/replica, multi-turn
+# math-code. This burst measures (a) acceptance length on our distribution and
+# (b) per-stream speedup per unit acceptance, giving the break-even acceptance
+# the Phase-2 online-trained drafter must clear.
+#
+# Drafter: SpecForge eagle3 head trained for exactly Qwen3-30B-A3B-Instruct-2507
+# (open-perfectblend, generic chat -> domain mismatch expected; that gap is
+# Phase 2's target). Local snapshot with max_position_embeddings patched if the
+# smoke shows speculation stopping past 2048 (SpecForge ships its training len).
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+policy:
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: "lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex"
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+
+logger:
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-eagle3-offline"
