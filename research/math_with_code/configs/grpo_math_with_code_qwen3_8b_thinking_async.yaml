@@ -283,8 +283,7 @@ data:
   use_multiple_dataloader: false
   train:
     # Relative to the driver working directory (the repo root).
-    # Alias matches harbor_datasets.dapo_math_17k_non8 in math_code_harbor_agent.yaml
-    # and the staged path /tmp/nemo_rl_math_code/dapo_math_17k_non8 on every node.
+    # Alias matches harbor_datasets.dapo_math_17k_non8 in math_code_harbor_agent.yaml.
     data_path: research/math_with_code/responses_api_agents/harbor_agent/data/math_code/dapo_math_17k_non8.jsonl
   validation:
     # Relative to the driver working directory (the repo root).

@@ -16,17 +16,17 @@ math_code_harbor_agent:
       concurrency: 128
 
       harbor_datasets:
+        # Agent servers run with responses_api_agents/harbor_agent as cwd;
+        # app.py resolves relative paths to shared absolute paths before the
+        # Ray job, so every dataset lives directly on shared storage.
         dapo_math_17k:
-          # Staged from one shared archive onto every Ray node before startup.
-          local_dataset_path: /tmp/nemo_rl_math_code/dapo_math_17k
+          local_dataset_path: data/math_code/dapo_math_17k
           workdir: /app
         dapo_math_17k_non8:
           # Rebuilt from the published filtered subset; see README Data section.
-          local_dataset_path: /tmp/nemo_rl_math_code/dapo_math_17k_non8
+          local_dataset_path: data/math_code/dapo_math_17k_non8
           workdir: /app
         dapo_math_1k:
-          # Agent servers run with responses_api_agents/harbor_agent as cwd.
-          # app.py resolves this to a shared absolute path before the Ray job.
           local_dataset_path: data/math_code/dapo_math_1k
           workdir: /app
         aime_2024:
