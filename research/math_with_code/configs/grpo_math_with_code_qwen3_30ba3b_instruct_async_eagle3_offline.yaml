@@ -12,8 +12,12 @@
 #
 # Drafter: SpecForge eagle3 head trained for exactly Qwen3-30B-A3B-Instruct-2507
 # (open-perfectblend, generic chat -> domain mismatch expected; that gap is
-# Phase 2's target). Local snapshot with max_position_embeddings patched if the
-# smoke shows speculation stopping past 2048 (SpecForge ships its training len).
+# Phase 2's target). Local copy of lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-
+# Instruct-2507-SpecForge-Nex @ d1ac703 with max_position_embeddings patched
+# 2048 -> 40960: the shipped value is SpecForge's training length and vLLM
+# clamps the drafter's rope to it, collapsing acceptance past position 2048
+# (smoke: accept_len 1.012/rate 0.4% pristine vs 2.184/39.5% patched at a
+# 6875-token prompt; below 2048 both give 2.888/62.9% at temp=1.0).
 defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
 
 policy:
@@ -21,7 +25,7 @@ policy:
     vllm_kwargs:
       speculative_config:
         method: "eagle3"
-        model: "lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex"
+        model: "/lustre/fsw/general_sa/alexq/models/eagle3-qwen3-30ba3b-2507-specforge-maxpos40960"
         num_speculative_tokens: 3
         draft_tensor_parallel_size: 1
 
