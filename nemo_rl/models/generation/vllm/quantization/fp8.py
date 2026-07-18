@@ -22,7 +22,6 @@ from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
@@ -161,15 +160,33 @@ def apply_fp8_patches(self, fp8_config):
             )
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
-        # SNR compared to plain fp32 scaling factors. This feature is still under active research.
+        # SNR compared to plain fp32 scaling factors. vLLM 0.20's quant kernels
+        # already implement pow2 scales behind the use_ue8m0 flag (normally
+        # driven by is_deep_gemm_e8m0_used()), so instead of shipping our own
+        # triton kernels we force use_ue8m0=True at the python entry point.
+        # Two patch targets: fused_moe/utils.py binds the function into its
+        # own namespace at import time (`from ...fp8_utils import
+        # per_token_group_quant_fp8`), so patching fp8_utils alone would
+        # leave the MoE experts' activation quant (the bulk of this model)
+        # silently on fp32 scales.
         if global_fp8_config.use_activation_pow2_scale:
-            func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
-            func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
-            func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
-            patcher2 = patch(func2_path, per_token_group_quant_fp8)
-            patcher3 = patch(func3_path, _per_token_group_quant_fp8)
-            patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-            fp8_state.vllm_patches.extend([patcher2, patcher3, patcher4])
+            from vllm.model_executor.layers.quantization.utils import (
+                fp8_utils as vllm_fp8_utils,
+            )
+
+            original_per_token_group_quant_fp8 = vllm_fp8_utils.per_token_group_quant_fp8
+
+            def pow2_per_token_group_quant_fp8(*args, **kwargs):
+                kwargs.setdefault("use_ue8m0", True)
+                return original_per_token_group_quant_fp8(*args, **kwargs)
+
+            for target in (
+                "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8",
+                "vllm.model_executor.layers.fused_moe.utils.per_token_group_quant_fp8",
+            ):
+                fp8_state.vllm_patches.append(
+                    patch(target, pow2_per_token_group_quant_fp8)
+                )
 
         # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
@@ -820,11 +837,26 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Use .copy_() to preserve weight_loader attribute on Parameters.
-    layer.w13_weight.copy_(w13)
-    layer.w2_weight.copy_(w2)
-    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    # Preserve the Parameter objects (and their weight_loader attribute, which
+    # refit needs) while installing the converted tensors. copy_() only works
+    # when the backend conversion is shape-preserving (triton); the SM100
+    # deepgemm/cutlass backends return re-laid-out tensors (block-swizzled
+    # weights / UE8M0-transposed scales), so fall back to rebinding .data —
+    # the Parameter identity and python attributes survive either way.
+    def _install(param, converted):
+        if param.data.shape == converted.shape and param.data.dtype == converted.dtype:
+            param.data.copy_(converted)
+        else:
+            # Rebind as-is: the converted tensors carry deliberate non-standard
+            # strides (e.g. DeepGEMM requires sf.stride(-3) == sf.stride(-1) *
+            # sf.size(-1) on scale factors); .contiguous() would flatten that
+            # layout and trip the kernel's stride assertions at dispatch.
+            param.data = converted
+
+    _install(layer.w13_weight, w13)
+    _install(layer.w2_weight, w2)
+    _install(getattr(layer, f"w13_{self.weight_scale_name}"), w13_scale)
+    _install(getattr(layer, f"w2_{self.weight_scale_name}"), w2_scale)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because
@@ -1057,139 +1089,3 @@ def process_weights_after_loading_kv(self, layer) -> None:
 
     # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
     # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
-
-
-@triton.jit
-def _per_token_group_quant_fp8(
-    # Pointers to inputs and output
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    # Num columns of y
-    y_num_columns,
-    y_row_stride,
-    # Avoid to divide zero
-    eps,
-    # Information for float8
-    fp8_min,
-    fp8_max,
-    # Meta-parameters
-    BLOCK: tl.constexpr,
-):
-    groups_per_row = y_num_columns // group_size
-
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
-    row = g_id // groups_per_row
-    row_g_id = g_id % groups_per_row
-
-    y_ptr += (row * y_row_stride) + (row_g_id * group_size)
-    y_q_ptr += g_id * group_size
-    y_s_ptr += g_id
-
-    cols = tl.arange(0, BLOCK)  # N <= BLOCK
-    mask = cols < group_size
-
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Quant
-    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-
-    # pow2_scale
-    inv_scale = fp8_max / _absmax
-    exponent = tl.floor(tl.log2(inv_scale))
-    # exponent is an integer
-    exponent = tl.minimum(exponent, 126.0)
-
-    # after rounding to exponent, round back to floating
-    inv_scale_pow2 = tl.exp2(exponent)
-
-    is_nan = inv_scale_pow2 != inv_scale_pow2
-    is_inf = (inv_scale_pow2 == 1.0 / 0.0) | (inv_scale_pow2 == -1.0 / 0.0)
-
-    # If the value is NaN or infinity, default it to 1.0,
-    # otherwise keep its original value.
-    inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
-    # finally uninverse
-    y_s = 1.0 / inv_scale_pow2
-
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
-
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.store(y_s_ptr, y_s)
-
-
-@triton.jit
-def _per_token_group_quant_fp8_colmajor(
-    # Pointers to inputs and output
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    # Num columns of y
-    y_num_columns,
-    y_row_stride,
-    # Stride from one column to the next of y_s
-    y_s_col_stride,
-    # Avoid to divide zero
-    eps,
-    # Information for float8
-    fp8_min,
-    fp8_max,
-    # Meta-parameters
-    BLOCK: tl.constexpr,
-):
-    groups_per_row = y_num_columns // group_size
-
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
-    row = g_id // groups_per_row
-    row_g_id = g_id % groups_per_row
-
-    y_ptr += (row * y_row_stride) + (row_g_id * group_size)
-    y_q_ptr += g_id * group_size
-
-    # Convert g_id the flattened block coordinate to 2D so we can index
-    # into the output y_scales matrix
-    blocks_per_row = y_num_columns // group_size
-    scale_col = g_id % blocks_per_row
-    scale_row = g_id // blocks_per_row
-    y_s_ptr += scale_col * y_s_col_stride + scale_row
-
-    cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
-    mask = cols < group_size
-
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-
-    # Quant pow2_scale:
-    inv_scale = fp8_max / _absmax
-    # calculate the nearest pow2 integer
-    exponent = tl.floor(tl.log2(inv_scale))
-    exponent = tl.minimum(exponent, 126.0)
-    # round inv_scale to the nearest pow2 with the exp we just calculated
-    inv_scale_pow2 = tl.exp2(exponent)
-    # If the value is NaN or infinity, default it to 1.0,
-    # otherwise keep its original value.
-    is_nan = inv_scale_pow2 != inv_scale_pow2
-    is_inf = (inv_scale_pow2 == float("inf")) | (inv_scale_pow2 == float("-inf"))
-    inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
-    # finally uninverse
-    y_s = 1.0 / inv_scale_pow2
-
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
-
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.store(y_s_ptr, y_s)
-
-
-def per_token_group_quant_fp8(
-    *args,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert global_fp8_config.use_activation_pow2_scale
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        per_token_group_quant_fp8 as vllm_per_token_group_quant_fp8,
-    )
-
-    return vllm_per_token_group_quant_fp8(*args, **kwargs)
