@@ -43,7 +43,9 @@ def spec_counters(llm) -> dict[str, float]:
     return counters
 
 
-def report(tag: str, before: dict[str, float], after: dict[str, float]) -> float:
+def report(
+    tag: str, before: dict[str, float], after: dict[str, float]
+) -> tuple[float, float]:
     drafts = after.get("vllm:spec_decode_num_drafts", 0.0) - before.get(
         "vllm:spec_decode_num_drafts", 0.0
     )
@@ -60,7 +62,7 @@ def report(tag: str, before: dict[str, float], after: dict[str, float]) -> float
         f"accepted={accepted:.0f} accept_len={accept_len:.3f} "
         f"accept_rate={accept_rate:.3f}"
     )
-    return drafts
+    return drafts, accept_len
 
 
 def main() -> None:
@@ -72,6 +74,7 @@ def main() -> None:
         gpu_memory_utilization=0.75,
         max_model_len=20480,
         enforce_eager=True,  # format-compat smoke; prod burst runs inductor
+        disable_log_stats=False,  # get_metrics() asserts log_stats enabled
         speculative_config={
             "method": "eagle3",
             "model": DRAFT,
@@ -114,11 +117,11 @@ def main() -> None:
     base = spec_counters(llm)
     out_short = llm.generate([short_prompt], params)
     mid = spec_counters(llm)
-    drafts_short = report("short-prompt", base, mid)
+    drafts_short, _ = report("short-prompt", base, mid)
 
     out_long = llm.generate([long_prompt], params)
     end = spec_counters(llm)
-    drafts_long = report("long-prompt>2048", mid, end)
+    drafts_long, accept_len_long = report("long-prompt>2048", mid, end)
 
     for tag, outs in (("short", out_short), ("long", out_long)):
         text = outs[0].outputs[0].text
@@ -131,6 +134,14 @@ def main() -> None:
     assert drafts_long > 0, (
         "speculation stopped past drafter max_position_embeddings — patch the "
         "drafter config.json (max_position_embeddings) before the val burst"
+    )
+    # Drafting without acceptance is worse than no speculation (pure draft
+    # overhead). Seen with the pristine SpecForge ckpt: accept_len 1.012 past
+    # position 2048 (its max_position_embeddings) vs 2.888 below it.
+    min_long = float(os.environ.get("SMOKE_MIN_LONG_ACCEPT_LEN", "1.3"))
+    assert accept_len_long >= min_long, (
+        f"deep-position acceptance collapsed ({accept_len_long:.3f} < "
+        f"{min_long}): drafter unusable at multi-turn context lengths"
     )
     print("[smoke] PASS")
 
