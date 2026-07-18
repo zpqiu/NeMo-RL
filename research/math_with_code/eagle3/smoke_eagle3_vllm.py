@@ -23,7 +23,7 @@ Gate for the math_with_code eagle3 track. Checks, in order:
 
 Usage (inside the training container, 1 GPU):
     SMOKE_DRAFT=<hf-repo-or-path> uv run python \
-        research/math_with_code/scripts/smoke_eagle3_vllm.py
+        research/math_with_code/eagle3/smoke_eagle3_vllm.py
 """
 
 import os

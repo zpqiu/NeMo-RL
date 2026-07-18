@@ -15,8 +15,9 @@ research/math_with_code/
 │   ├── configs/math_code_harbor_agent.yaml
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
-├── scripts/                            # dataset prepare/package/stage + node preflight
-├── docker/                             # math-code SIF build (aarch64)
+├── scripts/                            # dataset prepare/package/stage + node preflight (see scripts/README.md)
+├── eagle3/                             # EAGLE-3 speculative-decoding track (drafter smoke test)
+├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
 ├── experiments/                        # local-only launchers, gitignored (cluster-private paths)
 └── archive/                            # local-only backup, gitignored (see below)
 ```
