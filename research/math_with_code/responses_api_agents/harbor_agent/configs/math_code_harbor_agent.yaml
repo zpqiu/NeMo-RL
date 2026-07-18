@@ -16,25 +16,18 @@ math_code_harbor_agent:
       concurrency: 128
 
       harbor_datasets:
-        # Agent servers run with responses_api_agents/harbor_agent as cwd;
-        # app.py resolves relative paths to shared absolute paths before the
-        # Ray job, so every dataset lives directly on shared storage.
-        dapo_math_17k:
-          local_dataset_path: data/math_code/dapo_math_17k
-          workdir: /app
+        # The three datasets math_code/build_datasets.sh produces (non8 train,
+        # AIME 2024/2025 val). Agent servers run with
+        # responses_api_agents/harbor_agent as cwd; app.py resolves relative
+        # paths to shared absolute paths before the Ray job, so every dataset
+        # lives directly on shared storage.
         dapo_math_17k_non8:
-          # Rebuilt from the published filtered subset; see README Data section.
           local_dataset_path: data/math_code/dapo_math_17k_non8
-          workdir: /app
-        dapo_math_1k:
-          local_dataset_path: data/math_code/dapo_math_1k
           workdir: /app
         aime_2024:
           local_dataset_path: data/math_code/aime_2024
           workdir: /app
         aime_2025:
-          # Rebuilt from math-ai/aime25 (plain problem/answer format) via
-          # math_code/convert_plain_problem_answer.py + prepare_dataset.py.
           local_dataset_path: data/math_code/aime_2025
           workdir: /app
 
@@ -83,13 +76,12 @@ math_code_harbor_agent:
       harbor_raise_on_job_error: true
       harbor_validate_training_tokens: true
 
-      # Legacy ReTool-style shaping for task archives built BEFORE in-verifier
-      # shaping existed (canonical path: MATH_CODE_TOOL_SHAPING=1 at dataset
-      # build time; see README). Failed dapo rollouts earn 0.1 per executed
-      # tool call, capped at 0.4. Only exact-0 rewards are shaped, so this
-      # never stacks with verifier-shaped tasks. aime_2024 is excluded:
-      # validation stays pure accuracy.
-      harbor_tool_shaping_dataset_aliases: [dapo_math_17k]
+      # Legacy server-side ReTool shaping for task trees built BEFORE
+      # in-verifier shaping existed. Empty: build_datasets.sh bakes shaping
+      # into the non8 train tasks at build time (--tool-shaping), and eval
+      # sets stay pure accuracy. Only exact-0 rewards would be shaped, so
+      # listing an alias here never stacks with verifier-shaped tasks.
+      harbor_tool_shaping_dataset_aliases: []
 
       harbor_jobs_dir: jobs/math_code
       # Production RL keeps failures for diagnosis but removes healthy trial

@@ -54,8 +54,8 @@ harbor_agent automatically; sync manually by diffing against the submodule.
 # (x86 clusters: build from docker/math_code_aarch64.def instead, see docker/).
 # Then build the Harbor venv
 # (responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh with
-# NEMO_GYM_VENV_DIR on shared storage), and prepare the dataset
-# (responses_api_agents/harbor_agent/math_code/prepare_math_code_17k.sh).
+# NEMO_GYM_VENV_DIR on shared storage), and build all datasets
+# (MATH_CODE_SIF_PATH=<sif> responses_api_agents/harbor_agent/math_code/build_datasets.sh).
 
 # Launch training (submits via sbatch + ray.sub from the repo root):
 research/math_with_code/experiments/exp.sh \
@@ -122,43 +122,31 @@ Datasets come from two places:
   [alex-chiu/DAPO-Math-17k-Qwen3-8B-non8](https://huggingface.co/datasets/alex-chiu/DAPO-Math-17k-Qwen3-8B-non8)
   (public), source-format rows. Publishing this subset matters because the
   filter cost a full difficulty-labeling campaign (8 rollouts x 17398 prompts).
-- **Everything else rebuilds from scripts** (all under
-  `responses_api_agents/harbor_agent/math_code/`): full 17k or the filtered
-  set via `prepare_math_code_17k.sh`; AIME tasks via `prepare_dataset.py`.
-
-Rebuild the filtered task tree + request JSONL directly from the published
-subset (task ids are renumbered `task_000000..task_006388`; the tree/JSONL pair
-stays self-consistent):
+- **Everything else rebuilds from one script.** `build_datasets.sh` (under
+  `responses_api_agents/harbor_agent/math_code/`) builds the full supported
+  set — non8 train + AIME 2024/2025 val — in one pass:
 
 ```bash
-MATH_CODE_DATASET_REPO=alex-chiu/DAPO-Math-17k-Qwen3-8B-non8 \
-MATH_CODE_DATASET_REVISION=main \
-MATH_CODE_DATASET_PARQUET=data/train-00000-of-00001.parquet \
-MATH_CODE_DATASET_ALIAS=dapo_math_17k_non8 \
-MATH_CODE_EXPECTED_TASKS=6389 \
-MATH_CODE_TOOL_SHAPING=1 \
-    responses_api_agents/harbor_agent/math_code/prepare_math_code_17k.sh
+MATH_CODE_SIF_PATH=/shared/path/to/math-code.sif \
+    responses_api_agents/harbor_agent/math_code/build_datasets.sh
 ```
 
-`MATH_CODE_TOOL_SHAPING=1` bakes ReTool-style reward shaping into the built
-tasks (failed answers earn 0.1 per executed tool call, capped at 0.4; see
-`math_code/templates/verify.py`). Use it for train sets only, so eval accuracy
-stays a pure correctness metric.
+That is the only input; sources, aliases, task counts, and reward shaping are
+fixed inside the script. It converts the non8 subset (task ids renumbered
+`task_000000..task_006388`, tree/JSONL pair self-consistent),
+[tongyx361/AIME-2024-Boxed](https://huggingface.co/datasets/tongyx361/AIME-2024-Boxed),
+and [math-ai/aime25](https://huggingface.co/datasets/math-ai/aime25) (plain
+problem/answer rows, adapted via `convert_plain_problem_answer.py` so prompts
+match the train template).
 
-Rebuild the AIME 2024 eval set (30 boxed tasks from
-[tongyx361/AIME-2024-Boxed](https://huggingface.co/datasets/tongyx361/AIME-2024-Boxed);
-no tool shaping — run from this project directory):
+The train set is built with `--tool-shaping`: ReTool-style reward shaping baked
+into the tasks (failed answers earn 0.1 per executed tool call, capped at 0.4;
+see `math_code/templates/verify.py`). Eval sets are built without it, so eval
+accuracy stays a pure correctness metric.
 
-```bash
-uv run python responses_api_agents/harbor_agent/math_code/prepare_dataset.py \
-    --dataset tongyx361/AIME-2024-Boxed \
-    --dataset-alias aime_2024 \
-    --split train \
-    --sif-path "$MATH_CODE_SIF_PATH" \
-    --tasks-dir responses_api_agents/harbor_agent/data/math_code/aime_2024 \
-    --jsonl-path responses_api_agents/harbor_agent/data/math_code/aime_2024.jsonl \
-    --overwrite
-```
+For a custom dataset, drive `prepare_dataset.py` directly — it accepts a HF
+dataset name, local parquet shards, or Dataset Server JSON, plus
+`--sif-path/--tasks-dir/--jsonl-path` and optional `--tool-shaping`.
 
 Harbor trial outputs land in `responses_api_agents/harbor_agent/jobs/`
 (gitignored). Successful trials are deleted automatically; failed ones are kept
