@@ -1,0 +1,31 @@
+# FP8-rollout variant B: CUTLASS blockwise W8A8 instead of DeepGEMM, plus
+# torch.compile (inductor) for the generation graph so the per-token-group
+# activation-quant kernels can fuse. Probes how much of the small-M FP8 tax
+# (M~32 decode on GB200) is DeepGEMM/eager-mode specific rather than inherent
+# to blockwise FP8. Compare against the DeepGEMM recipe
+# (grpo_math_with_code_qwen3_8b_thinking_async_fp8_rollout.yaml) and the BF16
+# baseline at the same conc256/inflight32 operating point.
+defaults: grpo_math_with_code_qwen3_8b_thinking_async.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      use_deep_gemm: false
+      # vLLM auto-enables DeepGEMM when the package is importable; pin it off
+      # so the blockwise GEMMs dispatch to the CUTLASS SM100 kernels.
+      env_vars:
+        VLLM_USE_DEEP_GEMM: "0"
+        VLLM_USE_DEEP_GEMM_E8M0: "0"
+      # The CUTLASS path takes FP32 blockwise scales directly (the UE8M0
+      # power-of-two constraint is DeepGEMM-specific), so refit weights keep
+      # full-precision scales and no requant idempotence trick is needed.
+      pow2_weight_scaling_factors: false
+      pow2_activation_scaling_factors: false
+    vllm_kwargs:
+      compilation_config:
+        backend: inductor
+
+logger:
+  wandb:
+    name: "qwen3-8b-thinking-mathcode-async-fp8-cutlass"

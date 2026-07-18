@@ -1,0 +1,38 @@
+# FP8-rollout A/B for the 30B-A3B MoE: identical operating point to the BF16
+# bring-up config; only vLLM generation switches to blockwise FP8. Unlike the
+# 8B dense case (KV-bound, FP8 topped out at parity), MoE decode at small
+# per-replica M is weight-traffic-bound — routed experts fan out across the
+# batch so per-iteration expert reads approach the full 61GB — which is the
+# regime where FP8's weight halving has real headroom. CUTLASS path with
+# fp32 blockwise scales, matching the 8B finding that GEMM kernel choice is
+# neutral and the UE8M0/pow2 dance is DeepGEMM-specific.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+loss_fn:
+  # NeMo-RL guards FP8 vLLM generation behind importance-sampling correction
+  # (same as the 8B fp8_rollout recipe). BF16 arm stays reference-faithful
+  # with it off; the correction only affects training, not the val readout.
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      # On-the-fly FP8 with the triton MoE backend (inherited from the base
+      # yaml's kernel_config). Both earlier numerics failures — DeepGEMM/
+      # E8M0/pow2 instant-EOS (job 2359913) and CUTLASS-MoE NaN logprobs
+      # (job 2360319) — were measured under moe_backend=auto (FlashInfer
+      # kernel formats). The triton path keeps checkpoint layout and plain
+      # fp32 blockwise scales end-to-end, which is also what the refit
+      # quantization path assumes. Dense linears stay on the CUTLASS w8a8
+      # path validated on the 8B recipe.
+      use_deep_gemm: false
+      env_vars:
+        VLLM_USE_DEEP_GEMM: "0"
+        VLLM_USE_DEEP_GEMM_E8M0: "0"
+      pow2_weight_scaling_factors: false
+      pow2_activation_scaling_factors: false
+
+logger:
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-async-fp8"

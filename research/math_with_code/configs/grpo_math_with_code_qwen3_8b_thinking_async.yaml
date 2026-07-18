@@ -63,7 +63,7 @@ checkpointing:
   checkpoint_dir: "results/grpo-math-with-code-qwen3-8b/checkpoints"
   metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 3
+  keep_top_k: 1
   save_period: 5
   checkpoint_must_save_by: "00:03:45:00"
   save_optimizer: true
@@ -259,7 +259,11 @@ policy:
           truncate_history_thinking: false
     vllm_kwargs:
       compilation_config:
-        backend: eager
+        # inductor since 2026-07-10 (was eager, a leftover from hang debugging):
+        # fuses the FP8 per-token-group quant kernels and aligns all A/B arms
+        # (bf16 / fp8-deepgemm / fp8-cutlass) on the same compilation backend.
+        # Applies from each chain's next window; earlier segments ran eager.
+        backend: inductor
     colocated:
       # Async GRPO requires non-colocated inference: dedicate 2 nodes (8 GPUs) to
       # vLLM generation; the remaining node (4 GPUs) runs dtensor training.

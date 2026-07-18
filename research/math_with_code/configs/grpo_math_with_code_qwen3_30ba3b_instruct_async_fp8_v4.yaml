@@ -1,0 +1,34 @@
+# FP8-rollout v4: v3's FP8 recipe + keep the MoE router (mlp.gate) in bf16.
+# Split into its own file so the still-running v3 FP8 chain (which reads
+# grpo_math_with_code_qwen3_30ba3b_instruct_async_fp8.yaml from the mounted
+# worktree) finishes unpolluted.
+#
+# Why: the on-the-fly FP8 path has no ignore list, and vLLM 0.20's
+# qwen3_moe.py passes quant_config to the router gate's ReplicatedLinear, so
+# v2/v3 quantized the router. The official Qwen3-30B-A3B-Instruct-2507-FP8
+# checkpoint excludes all 48 mlp.gate layers (+ lm_head) via
+# modules_to_not_convert, and the Megatron trainer runs the router in fp32
+# (moe_router_dtype) — our rollout engine was the only place routing ran in
+# FP8. Router noise flips top-8 expert selection near decision boundaries — a
+# discrete computation-path perturbation, prime suspect for the v3
+# exploration suppression (policy entropy -35% vs BF16 from step ~20,
+# tool-use pinned at ~7.4 vs BF16's 12.8 after its step-~120 phase
+# transition, val gap ~5 pts concentrated in heavy-tool problems).
+#
+# Causal predictions if the suspect is right: gen_kl_error 0.0072 -> near the
+# BF16 arm's 0.0015, approx_entropy re-pariting with BF16, tool count
+# unfreezing. Follow-up knob if the gap persists: num_last_layers_in_bf16: 2.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async_fp8.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      # Expands to full names (model.layers.N.mlp.gate) matched against HF
+      # param paths; does not match the experts' gate_proj (their path is
+      # mlp.experts.N.gate_proj). lm_head needs no entry: ParallelLMHead is
+      # not LinearBase, so vLLM's Fp8Config never quantizes it.
+      quantization_ignored_layer_kws: ["mlp.gate"]
+
+logger:
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-async-fp8-v4"

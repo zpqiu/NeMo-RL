@@ -1,8 +1,9 @@
 # EAGLE-3 track, Phase 1: OFFLINE drafter, val-burst measurement only.
 # Identical operating point to the BF16 async base; the only change is vLLM
-# speculative decoding with a fixed (not RL-trained) eagle3 drafter. Run under
-# NRL_SKIP_REFIT=1 like the FP8 bring-up windows: val-at-start readout is the
-# experiment; do not chain training steps from these windows.
+# speculative decoding with a fixed (not RL-trained) eagle3 drafter. The
+# val-at-start readout is the experiment; do not chain training steps from
+# these windows. (Phase-1 bursts ran under a since-removed NRL_SKIP_REFIT
+# escape hatch; reruns take the normal dummy-load + initial-refit path.)
 #
 # Purpose is CALIBRATION, not go/no-go: published eagle3 numbers are batch=1 /
 # near-greedy; our operating point is temp=1.0, ~64 streams/replica, multi-turn
