@@ -18,8 +18,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-HARBOR_ROOT="$PROJECT_ROOT/responses_api_agents/harbor_agent"
+HARBOR_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd -- "$HARBOR_ROOT/../.." && pwd)"
 VENV_ROOT="${NEMO_GYM_VENV_DIR:?export NEMO_GYM_VENV_DIR to the shared Gym venv root}"
 HARBOR_PYTHON="$VENV_ROOT/responses_api_agents/harbor_agent/.venv/bin/python"
 TASK_DIR="${MATH_CODE_PREFLIGHT_TASK_DIR:-$HARBOR_ROOT/data/math_code/aime_2024/task_000000}"

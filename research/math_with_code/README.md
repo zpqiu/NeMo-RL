@@ -11,11 +11,10 @@ in-container Python session, and trained with NeMo-RL async GRPO.
 research/math_with_code/
 ├── responses_api_agents/harbor_agent/  # Overlay fork of nemo-gym's harbor_agent server
 │   ├── custom_agents/math_code_*.py    #   the math-code agent + persistent Python session
-│   ├── math_code/                      #   dataset conversion, venv build, runtime validation
+│   ├── math_code/                      #   all tooling: dataset build, node preflight, venv build, runtime validation
 │   ├── configs/math_code_harbor_agent.yaml
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
-├── scripts/                            # dataset prepare/package/stage + node preflight (see scripts/README.md)
 ├── eagle3/                             # EAGLE-3 speculative-decoding track (drafter smoke test)
 ├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
 ├── experiments/                        # local-only launchers, gitignored (cluster-private paths)
@@ -56,7 +55,7 @@ harbor_agent automatically; sync manually by diffing against the submodule.
 # Then build the Harbor venv
 # (responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh with
 # NEMO_GYM_VENV_DIR on shared storage), and prepare the dataset
-# (scripts/prepare_math_code_17k.sh).
+# (responses_api_agents/harbor_agent/math_code/prepare_math_code_17k.sh).
 
 # Launch training (submits via sbatch + ray.sub from the repo root):
 research/math_with_code/experiments/exp.sh \
@@ -78,20 +77,19 @@ research/math_with_code/experiments/exp.sh \
   image's uv) must all run through `srun --container-image=<training sqsh>`
   on a compute node. The Harbor venv is arch-specific: build it where it will
   run, on shared storage.
-- **Per-node setup contract**: `scripts/stage_math_code_dataset.sh` and
-  `scripts/preflight_math_with_code_node.sh` read `NEMO_GYM_VENV_DIR`,
-  `MATH_CODE_DATASET_ALIAS`, `MATH_CODE_EXPECTED_TASKS`, and — for
-  non-default paths — `MATH_CODE_TASKS_ARCHIVE`/`MATH_CODE_TASKS_DIR`.
-  Export them in the scheduler wrapper so they reach ray.sub's
-  `SETUP_COMMAND` environment on every node.
+- **Per-node setup contract**:
+  `responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh`
+  reads `NEMO_GYM_VENV_DIR` (and `MATH_CODE_PREFLIGHT_TASK_DIR` to check a
+  non-default task). Export them in the scheduler wrapper so they reach
+  ray.sub's `SETUP_COMMAND` environment on every node.
 
 `~/.exp_env` must provide `WANDB_API_KEY`, `ACCOUNT`, `MOUNTS`, and optionally
 `CONTAINER`. Results and Slurm logs land under the repo-root `results/` tree.
 
 `experiments/` is local-only (gitignored) because the launchers embed
 cluster-private account and storage paths. On another cluster, drive
-`configs/` + `scripts/` from your own scheduler wrapper: run the per-node
-`scripts/stage_math_code_dataset.sh` + `scripts/preflight_math_with_code_node.sh`
+`configs/` from your own scheduler wrapper: run the per-node
+`responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh`
 as setup, then `uv run python examples/nemo_gym/run_grpo_nemo_gym.py --config
 research/math_with_code/configs/grpo_math_with_code_qwen3_8b_thinking_async.yaml`
 from the repo root.
@@ -107,16 +105,15 @@ The data model has two layers that must stay consistent:
   only the index NeMo-RL's dataloader iterates; each row references a task in
   one of the agent's `harbor_datasets`.
 - The **task tree** (one directory per task: `instruction.md`, `task.toml`,
-  `tests/`, `environment/`) is what Harbor actually executes. Train-scale
-  trees are inode-heavy (~8 inodes/task), so they ship as a single `tar.gz`
-  on shared storage and are extracted onto node-local disk
-  (`/tmp/nemo_rl_math_code/<alias>`) by `scripts/stage_math_code_dataset.sh`
-  on every node before Ray starts. Small eval sets (AIME: 30 tasks) skip the
-  archive and live directly on shared storage.
+  `tests/`, `environment/`) is what Harbor actually executes. All trees live
+  directly on shared storage under `data/math_code/<alias>/`. They cost ~8
+  inodes/task, fine at the few-thousand-task scale used here; if you scale to
+  a much larger set, revisit (git history has a tar.gz + node-local staging
+  flow that was removed for simplicity).
 - The dataset **alias** ties the layers together: it must match the
   `harbor_datasets` key in `configs/math_code_harbor_agent.yaml` (whose
-  `local_dataset_path` points at the staged path), the archive filename, and
-  the JSONL filename in `data.train.data_path`.
+  `local_dataset_path` points at the task tree) and the JSONL filename in
+  `data.train.data_path`.
 
 Datasets come from two places:
 
@@ -125,10 +122,9 @@ Datasets come from two places:
   [alex-chiu/DAPO-Math-17k-Qwen3-8B-non8](https://huggingface.co/datasets/alex-chiu/DAPO-Math-17k-Qwen3-8B-non8)
   (public), source-format rows. Publishing this subset matters because the
   filter cost a full difficulty-labeling campaign (8 rollouts x 17398 prompts).
-- **Everything else rebuilds from scripts.** Full 17k (or the filtered set)
-  via `scripts/prepare_math_code_17k.sh`; AIME tasks via
-  `responses_api_agents/harbor_agent/math_code/prepare_dataset.py`; nodes stage
-  the archive locally with `scripts/stage_math_code_dataset.sh`.
+- **Everything else rebuilds from scripts** (all under
+  `responses_api_agents/harbor_agent/math_code/`): full 17k or the filtered
+  set via `prepare_math_code_17k.sh`; AIME tasks via `prepare_dataset.py`.
 
 Rebuild the filtered task tree + request JSONL directly from the published
 subset (task ids are renumbered `task_000000..task_006388`; the tree/JSONL pair
@@ -141,7 +137,7 @@ MATH_CODE_DATASET_PARQUET=data/train-00000-of-00001.parquet \
 MATH_CODE_DATASET_ALIAS=dapo_math_17k_non8 \
 MATH_CODE_EXPECTED_TASKS=6389 \
 MATH_CODE_TOOL_SHAPING=1 \
-    scripts/prepare_math_code_17k.sh
+    responses_api_agents/harbor_agent/math_code/prepare_math_code_17k.sh
 ```
 
 `MATH_CODE_TOOL_SHAPING=1` bakes ReTool-style reward shaping into the built
@@ -151,7 +147,7 @@ stays a pure correctness metric.
 
 Rebuild the AIME 2024 eval set (30 boxed tasks from
 [tongyx361/AIME-2024-Boxed](https://huggingface.co/datasets/tongyx361/AIME-2024-Boxed);
-no staging archive, no tool shaping — run from this project directory):
+no tool shaping — run from this project directory):
 
 ```bash
 uv run python responses_api_agents/harbor_agent/math_code/prepare_dataset.py \
