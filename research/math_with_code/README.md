@@ -46,53 +46,78 @@ mechanisms:
 The trade-off: this directory no longer receives upstream Gym changes to
 harbor_agent automatically; sync manually by diffing against the submodule.
 
-## Running
+## Bring-up
+
+This assumes you have already run a single-turn GRPO job with NeMo-RL on your
+cluster — container, `sbatch + ray.sub` submission, `uv` — per
+[docs/cluster.md](../../docs/cluster.md) and
+[docs/guides/grpo.md](../../docs/guides/grpo.md). Only the math-code deltas
+are listed here.
+
+**Prerequisites on top of stock single-turn GRPO:**
+
+- A recent NeMo-RL image (nightly or >= 0.7): the recipe additionally needs
+  `singularity`/`apptainer` and the prebuilt NemoGym venv inside the training
+  container.
+- The Gym submodule checked out: `git submodule update --init
+  3rdparty/Gym-workspace/Gym` (the Harbor venv editable-installs it).
+- `/dev/fuse:/dev/fuse` in the container mounts of **every** job below,
+  including training. Harbor trials run `singularity exec` inside the
+  training container and squashfuse needs the device; missing it fails with
+  `squashfuse_ll exited: fuse: device not found`.
+- Hugging Face network access for steps 2–3.
+
+All three one-time steps run inside the training container **on the
+compute-node architecture** (x86 login nodes won't do for aarch64 clusters:
+the venv is arch-specific and the SIF pull needs apptainer) — e.g. via
+`srun --container-image=<training image> --container-mounts=...,/dev/fuse:/dev/fuse`.
+Outputs all land on shared storage.
 
 ```bash
-# One-time: get the runtime SIF — pull the prebuilt aarch64 image
-#     apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
-# (x86 clusters: build from docker/math_code_aarch64.def instead, see docker/).
-# Then build the Harbor venv
-# (responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh with
-# NEMO_GYM_VENV_DIR on shared storage), and build all datasets
-# (MATH_CODE_SIF_PATH=<sif> responses_api_agents/harbor_agent/math_code/build_datasets.sh).
+# 1. Pull the per-trial SIF (x86 clusters: build via docker/ instead).
+apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
 
-# Launch training (submits via sbatch + ray.sub from the repo root):
-research/math_with_code/experiments/exp.sh \
-    research/math_with_code/experiments/grpo-math-code-qwen3-8b-async-3x4.sh
+# 2. Build the Harbor venv (NEMO_GYM_VENV_DIR on shared storage).
+NEMO_GYM_VENV_DIR=/shared/gym_venvs \
+    responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh
+
+# 3. Build all three datasets (non8 train + AIME 2024/2025 val).
+MATH_CODE_SIF_PATH=$PWD/math-code-sif_py312-aarch64.sif \
+    responses_api_agents/harbor_agent/math_code/build_datasets.sh
+
+# Optional: end-to-end sanity check — one real Harbor trial against a fake
+# Responses API, no GPUs or policy model needed.
+NEMO_GYM_VENV_DIR=/shared/gym_venvs \
+    responses_api_agents/harbor_agent/math_code/validate_runtime.sh
 ```
 
-### Cluster prerequisites
+**Launch** is the standard `sbatch + ray.sub` flow from
+[docs/cluster.md](../../docs/cluster.md) with two math-code additions: a
+repo-root symlink that lets the overlay fork win nemo-gym's cwd-first server
+discovery (see "How the overlay fork works"), and a per-node preflight in
+`SETUP_COMMAND`:
 
-- **`/dev/fuse` must be visible inside the training container.** Harbor
-  trials run `singularity exec` on the per-trial SIF from inside the training
-  container; squashfuse needs `/dev/fuse`, and pyxis/enroot does not expose
-  it on every cluster. Symptom: `FATAL: container creation failed: ...
-  squashfuse_ll exited: fuse: device not found`. Fix: add
-  `/dev/fuse:/dev/fuse` to the container mounts of every job — the one-time
-  setup jobs and the ray.sub training job alike.
-- **Run every one-time step on the compute-node architecture.** On clusters
-  with x86 login nodes and aarch64 compute (e.g. GB200), the SIF pull (needs
-  apptainer), the Harbor venv build, and dataset prep (both need the training
-  image's uv) must all run through `srun --container-image=<training sqsh>`
-  on a compute node. The Harbor venv is arch-specific: build it where it will
-  run, on shared storage.
-- **Per-node setup contract**:
-  `responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh`
-  reads `NEMO_GYM_VENV_DIR` (and `MATH_CODE_PREFLIGHT_TASK_DIR` to check a
-  non-default task). Export them in the scheduler wrapper so they reach
-  ray.sub's `SETUP_COMMAND` environment on every node.
+```bash
+cd <repo-root>
+ln -sfn research/math_with_code/responses_api_agents responses_api_agents
 
-`~/.exp_env` must provide `WANDB_API_KEY`, `ACCOUNT`, `MOUNTS`, and optionally
-`CONTAINER`. Results and Slurm logs land under the repo-root `results/` tree.
+SETUP_COMMAND="export NEMO_GYM_VENV_DIR=/shared/gym_venvs && \
+    ./research/math_with_code/responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh" \
+COMMAND="export NEMO_GYM_VENV_DIR=/shared/gym_venvs && \
+    uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+    --config research/math_with_code/configs/grpo_math_with_code_qwen3_8b_thinking_async.yaml" \
+CONTAINER=<training image> \
+MOUNTS="<your mounts>,/dev/fuse:/dev/fuse" \
+GPUS_PER_NODE=4 \
+    sbatch --nodes=3 --account=... --job-name=... ray.sub
+```
 
-`experiments/` is local-only (gitignored) because the launchers embed
-cluster-private account and storage paths. On another cluster, drive
-`configs/` from your own scheduler wrapper: run the per-node
-`responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh`
-as setup, then `uv run python examples/nemo_gym/run_grpo_nemo_gym.py --config
-research/math_with_code/configs/grpo_math_with_code_qwen3_8b_thinking_async.yaml`
-from the repo root.
+The 8B config wants 3 nodes x 4 GPUs (2 generation + 1 training, see the
+yaml's cluster block); the 30B config wants 4 nodes. `WANDB_API_KEY` in the
+environment enables W&B logging as usual.
+
+`experiments/` is a local-only (gitignored) convenience layer over exactly
+this flow — launchers there embed cluster-private account and storage paths.
 
 ## Data
 
