@@ -35,11 +35,18 @@ fail() {
     exit 1
 }
 
-[[ "$(uname -m)" == "aarch64" ]] || fail "expected aarch64, got $(uname -m)"
 [[ -x "$HARBOR_PYTHON" ]] || fail "Harbor Python is not executable: $HARBOR_PYTHON"
 [[ -f "$MATH_CONFIG" ]] || fail "current math-code config is missing: $MATH_CONFIG (check the /opt/nemo-rl live mount)"
 [[ -f "$MATH_AGENT" ]] || fail "current math-code agent is missing: $MATH_AGENT (check the /opt/nemo-rl live mount)"
 [[ -d "$TASK_DIR" ]] || fail "task directory is missing: $TASK_DIR"
+
+# nemo-gym resolves server dirs cwd-first; without the repo-root symlink it
+# silently falls back to the pristine Gym submodule's harbor_agent instead of
+# this overlay (see README "How the overlay fork works").
+REPO_ROOT="$(cd -- "$PROJECT_ROOT/../.." && pwd)"
+OVERLAY_DIR="$(readlink -f "$PROJECT_ROOT/responses_api_agents")"
+[[ "$(readlink -f "$REPO_ROOT/responses_api_agents")" == "$OVERLAY_DIR" ]] || \
+    fail "repo-root responses_api_agents does not point at the overlay; run: ln -sfn research/math_with_code/responses_api_agents $REPO_ROOT/responses_api_agents"
 
 SIF_PATH="$(sed -n 's/^docker_image = "\(.*\)"/\1/p' "$TASK_DIR/task.toml")"
 [[ -n "$SIF_PATH" && -r "$SIF_PATH" ]] || fail "shared SIF is missing or unreadable: $SIF_PATH"
@@ -55,10 +62,10 @@ import nemo_gym
 import pydantic
 import ray
 
-assert platform.machine() == "aarch64"
 print(
-    f"python={sys.version.split()[0]} harbor={harbor.__file__} "
-    f"nemo_gym={nemo_gym.__file__} ray={ray.__version__} pydantic={pydantic.__version__}"
+    f"python={sys.version.split()[0]} machine={platform.machine()} "
+    f"harbor={harbor.__file__} nemo_gym={nemo_gym.__file__} "
+    f"ray={ray.__version__} pydantic={pydantic.__version__}"
 )
 PY
 
