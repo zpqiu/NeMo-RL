@@ -32,6 +32,11 @@ math_code_harbor_agent:
         aime_2024:
           local_dataset_path: data/math_code/aime_2024
           workdir: /app
+        aime_2025:
+          # Rebuilt from math-ai/aime25 (plain problem/answer format) via
+          # math_code/convert_plain_problem_answer.py + prepare_dataset.py.
+          local_dataset_path: data/math_code/aime_2025
+          workdir: /app
 
       harbor_agent_name: null
       harbor_agent_import_path: responses_api_agents.harbor_agent.custom_agents.math_code_harbor_agent:MathCodeHarborAgent

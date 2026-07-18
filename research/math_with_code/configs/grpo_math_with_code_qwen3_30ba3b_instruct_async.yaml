@@ -1,0 +1,341 @@
+# Async GRPO on Harbor math-code tasks with Qwen3-30B-A3B-Instruct-2507 (MoE).
+# Bring-up sizing for GB200 (4 GPUs/node): 4 nodes = 2 generation (vLLM TP2,
+# 4 replicas) + 2 training (Megatron TP4 x EP8 across 8 GPUs). Non-thinking
+# instruct model: no reasoning parser and no chat-template override (the stock
+# Qwen3-Instruct template keeps tool_call turns intact without a think hack).
+# Loss: token-level GRPO + TIS(max=2), mirroring the proven 8B recipe.
+# The 30B-A3B reference prefers GSPO for MoE, but GSPO's sequence-level IS
+# ratios are products over ~6k tokens: FP8's per-token logprob bias (4x
+# bf16's) compounds and collapses the applied sequence weights to ~0.024
+# (vs bf16 0.145) — a 6x weaker gradient signal that flatlined the FP8-v2
+# arm (see fp8-rollout memory, 2026-07-13). Token-level ratios do not
+# compound, so GRPO+TIS removes the collapse mechanism entirely.
+# Validation: AIME 2025 (30 tasks x 16 repeats), rebuilt from math-ai/aime25.
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1   # gym manages its own internal tool-call steps; NeMo-RL sees one rollout
+  max_num_epochs: 100
+  max_num_steps: 100000
+  normalize_rewards: true
+  use_leave_one_out_baseline: false
+  val_period: 10
+  val_at_start: true
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: null
+  async_grpo:
+    # Re-enabled after the refit root cause was fixed: the async collective
+    # consumers were dying inside FusedMoE.weight_loader (the same
+    # flashinfer-backend 4D-layout bug that broke sync ZMQ refit, jobs
+    # 2358604/19, 2359035/36, 2359663) and never joined the broadcast, so
+    # producers spun forever. kernel_config.moe_backend=triton keeps
+    # checkpoint layout and refit works (validated: job 2360814 ran
+    # rollout->train->refit->rollout for multiple steps).
+    enabled: true
+    max_trajectory_age_steps: 1
+    # 64 groups = exactly one step of prompts in flight (age-safe with
+    # max_trajectory_age_steps=1); 64 x 16 = 1024 submitted = 2x the harbor
+    # concurrency (512). Perf sweep on 2+2 nodes (jobs 2360887/923/939):
+    # conc256 was generation-bound (step time trending ~580s); conc512 fully
+    # hides generation behind the ~320s training wall (exposed_generation
+    # ~0); conc1024 adds nothing further. Default timeouts hold at conc512.
+    max_inflight_prompt_groups: 64
+    # false: with the Megatron policy backend, in-flight broadcasts deadlock —
+    # jobs 2358604/2358619 (and the TP2 pair before them) froze with trainer
+    # ranks spinning in packed_broadcast_producer (megatron_policy_worker.py:
+    # 1362 -> packed_tensor.py:68 stream sync) while the vLLM consumers never
+    # joined the collective. py-spy-confirmed. The dtensor 8B stack runs
+    # in-flight updates fine; step-boundary sync is the safe mode here.
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  # GRPO token-level clips, mirroring the 8B math-code recipe.
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+  use_on_policy_kl_approximation: false
+  # Async GRPO requires importance-sampling correction (asserted in setup).
+  use_importance_sampling_correction: true
+  # Token-level TIS with upper clamp 2.0 (8B-proven). No min bound needed:
+  # per-token ratios sit near 1 and cannot collapse the way sequence-level
+  # products did (GSPO-era history: unclamped products -> step-190 collapse;
+  # clamped products -> 6x gradient starvation on the FP8 arm).
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  # false = token-level GRPO (was GSPO; see header for why we left it).
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-math-with-code-qwen3-30ba3b/checkpoints"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 5
+  # 30B MoE checkpoints are slow; leave more margin inside the 4h window.
+  checkpoint_must_save_by: "00:03:30:00"
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    # Instruct-2507 is non-thinking: its template takes no enable_thinking
+    # kwarg, so chat_template_kwargs stays empty.
+    chat_template_kwargs: {}
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 32  # HF backend only; Harbor concurrency is configured separately
+  max_total_sequence_length: 20480
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+
+  draft:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  # Sequence packing is required to use context/sequence parallel in mcore
+  # and gives the MoE permute-fusion speedups.
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    # 8 training GPUs (2 GB200 nodes): experts shard across all of them.
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    # Sequence parallel is required for expert parallel.
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none  # aux-loss types diverge logprobs for grpo
+    moe_router_bias_update_rate: 0.0
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    # Read via direct indexing in nemo_rl/models/megatron/setup.py (schema
+    # marks them NotRequired but the exemplar always sets them).
+    train_iters: 100000
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 2.0e-6
+      min_lr: ${policy.megatron_cfg.optimizer.lr}
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: ${policy.megatron_cfg.optimizer.lr}
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  generation:
+    # Explicit non-overlapping ranges; see ray.sub for the complete layout.
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      # TP1 (was TP2): job 2357845 deadlocked ~13min in — training ranks
+      # spinning at 100% in a collective, gen fleet idle. TP2 is the one new
+      # gen-side variable vs the proven 8B stack (it switches vLLM to the ray
+      # distributed executor path); TP1 also matches the H100 experience that
+      # FP8 MoE speedup only shows at TP1. 61GB weights fit a GB200 rank:
+      # 0.75 util leaves ~78GB KV = ~39 full-length streams x 8 replicas.
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      # Non-colocated: generation owns its GPUs fully.
+      gpu_memory_utilization: 0.75
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      kv_cache_dtype: "auto"
+      expose_http_server: true
+      skip_tokenizer_init: false
+      enable_thinking: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        # Stock Qwen3 instruct template handles multi-turn tool calls without
+        # a custom template (nothing to preserve across turns in a
+        # non-thinking model); no reasoning parser either.
+        tool_parser: hermes
+    vllm_kwargs:
+      compilation_config:
+        backend: inductor
+      kernel_config:
+        # triton keeps FusedMoE weights in the plain [E, 2I, H] checkpoint
+        # layout. The GB200 default (auto -> flashinfer_*) swizzles them to a
+        # 4D kernel format after the initial load, and every subsequent refit
+        # then crashes inside FusedMoE.weight_loader ("shard_dim=0 is not a
+        # valid data dimension for a 3D tensor", jobs 2359663/2360799):
+        # the refit path replays checkpoint-semantics loading against
+        # already-converted params. Layout-preserving backend = working refit.
+        moe_backend: "triton"
+    colocated:
+      # Async requires non-colocated: 2 nodes (8 GPUs, vLLM TP1 x 8 replicas)
+      # generate; 2 nodes run Megatron TP4 x EP8 training. Multi-turn Harbor
+      # sessions need generation continuously available — colocated
+      # sleep/wake per train step is a dead end for this workload.
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    # Relative to the driver working directory (the repo root).
+    data_path: research/math_with_code/responses_api_agents/harbor_agent/data/math_code/dapo_math_17k_non8.jsonl
+  validation:
+    # AIME 2025 (30 tasks; AIME 2024 is near-saturated for 30B-A3B-2507).
+    data_path: research/math_with_code/responses_api_agents/harbor_agent/data/math_code/aime_2025.jsonl
+    # One rollout per dataset row; repeat in-memory for mean accuracy over
+    # 16 samples/task.
+    repeat: 16
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    uv_venv_dir: ${oc.env:NEMO_GYM_VENV_DIR}
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! must be *for_training
+    - responses_api_agents/harbor_agent/configs/math_code_harbor_agent.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+    math_code_harbor_agent:
+      responses_api_agents:
+        harbor_agent:
+          harbor_agent_kwargs:
+            max_steps: 16
+          concurrency: 512
+          # Measurement leniency: score empty/token-less rollouts as failures
+          # instead of hard-crashing the whole run (fp8 arm produced sporadic
+          # empty generations; job 2359913 died on the first one).
+          harbor_raise_on_job_error: false
+          harbor_validate_training_tokens: false
+
+logger:
+  log_dir: "results/grpo-math-with-code-qwen3-30ba3b/logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "grpo-math-with-code"
+    name: "qwen3-30ba3b-instruct-mathcode-async"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  master_port_range_low: 25000
+  master_port_range_high: 28000
+  segment_size: null
