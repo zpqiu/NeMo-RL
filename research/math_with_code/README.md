@@ -15,6 +15,7 @@ research/math_with_code/
 │   ├── configs/math_code_harbor_agent.yaml
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
+├── reports/                            # experiment reports (wandb pull + figures + writeup)
 ├── eagle3/                             # EAGLE-3 speculative-decoding track (drafter smoke test)
 ├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
 ├── experiments/                        # local-only launchers, gitignored (cluster-private paths)
@@ -176,6 +177,14 @@ dataset name, local parquet shards, or Dataset Server JSON, plus
 Harbor trial outputs land in `responses_api_agents/harbor_agent/jobs/`
 (gitignored). Successful trials are deleted automatically; failed ones are kept
 for diagnosis and are worth purging occasionally to protect shared-fs inodes.
+
+## Reports
+
+- [`reports/fp8_rollout_30b/REPORT.md`](reports/fp8_rollout_30b/REPORT.md) —
+  BF16 vs FP8-rollout A/B on the 30B MoE: the router-quantization failure
+  mechanism (entropy collapse, frozen tool use, growing logprob bias) and the
+  v4 fix that reaches parity-or-better accuracy with the FP8 throughput win.
+  Data pull + figure scripts are alongside and re-runnable against wandb.
 
 ## Residual diffs outside this directory
 
