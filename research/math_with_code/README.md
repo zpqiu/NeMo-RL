@@ -16,36 +16,9 @@ research/math_with_code/
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
 ├── reports/                            # experiment reports (wandb pull + figures + writeup)
-├── eagle3/                             # EAGLE-3 speculative-decoding track (drafter smoke test)
 ├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
-├── experiments/                        # local-only launchers, gitignored (cluster-private paths)
-└── archive/                            # local-only backup, gitignored (see below)
+└── experiments/                        # local-only launchers, gitignored (cluster-private paths)
 ```
-
-## How the overlay fork works
-
-The Gym submodule (`3rdparty/Gym-workspace/Gym`) stays pristine at its pinned
-commit. This project carries a forked copy of the entire
-`responses_api_agents/harbor_agent` server directory, wired in via three
-mechanisms:
-
-1. **Server discovery** — nemo-gym checks `Path.cwd()/<server_rel_path>` before
-   its install location (`nemo_gym/cli.py`). `experiments/exp.sh` creates the
-   repo-root symlink `responses_api_agents ->
-   research/math_with_code/responses_api_agents` on every submit so the fork
-   wins; `config_paths` resolution works the same way. The symlink is a runtime
-   artifact (listed in `.git/info/exclude`, never committed) — recreate it with
-   the same `ln -sfn` if you launch without exp.sh.
-2. **Python imports** — the editable nemo-gym install maps
-   `responses_api_agents.*` to the pristine submodule via a setuptools
-   meta-path finder. PathFinder consults `sys.path` first, so the fork's
-   `app.py` prepends the overlay root to `sys.path` (server process) and to the
-   Harbor Ray worker's `PYTHONPATH` (`runner_ray_remote` runtime env).
-3. **Dependencies** — the fork's `requirements.txt` editable-installs nemo-gym
-   from the submodule by relative path.
-
-The trade-off: this directory no longer receives upstream Gym changes to
-harbor_agent automatically; sync manually by diffing against the submodule.
 
 ## Bring-up
 
@@ -200,10 +173,27 @@ research-specific):
 - `nemo_rl/environments/math_environment.py` — double-append reward fix on the
   verifier exception path.
 
-## archive/ (local-only, not in git)
+## How the overlay fork works
 
-Backup of retired tooling, kept only on this cluster: the one-shot
-difficulty-labeling scripts that produced the non8 filter (their labeled
-outputs live under `results/`), `core_difficulty_support.patch` preserving the
-reverted core NeMo-RL eval changes they relied on, and removed tests. Nothing
-here is needed for training runs.
+The Gym submodule (`3rdparty/Gym-workspace/Gym`) stays pristine at its pinned
+commit. This project carries a forked copy of the entire
+`responses_api_agents/harbor_agent` server directory, wired in via three
+mechanisms:
+
+1. **Server discovery** — nemo-gym checks `Path.cwd()/<server_rel_path>` before
+   its install location (`nemo_gym/cli.py`). `experiments/exp.sh` creates the
+   repo-root symlink `responses_api_agents ->
+   research/math_with_code/responses_api_agents` on every submit so the fork
+   wins; `config_paths` resolution works the same way. The symlink is a runtime
+   artifact (listed in `.git/info/exclude`, never committed) — recreate it with
+   the same `ln -sfn` if you launch without exp.sh.
+2. **Python imports** — the editable nemo-gym install maps
+   `responses_api_agents.*` to the pristine submodule via a setuptools
+   meta-path finder. PathFinder consults `sys.path` first, so the fork's
+   `app.py` prepends the overlay root to `sys.path` (server process) and to the
+   Harbor Ray worker's `PYTHONPATH` (`runner_ray_remote` runtime env).
+3. **Dependencies** — the fork's `requirements.txt` editable-installs nemo-gym
+   from the submodule by relative path.
+
+The trade-off: this directory no longer receives upstream Gym changes to
+harbor_agent automatically; sync manually by diffing against the submodule.

@@ -51,3 +51,6 @@ code_snapshots*/
 # Local research working artifacts (raw ledgers get distilled into READMEs)
 /reports/
 /session/
+
+# EAGLE-3 track: local-only until the online-drafter phase is ready to publish
+/research/math_with_code/eagle3/
