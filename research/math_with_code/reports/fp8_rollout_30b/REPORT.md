@@ -51,7 +51,7 @@ router excluded from quantization (blue) — the recommended configuration,
 matching the official Qwen FP8 checkpoint's `modules_to_not_convert`. The
 router-precision choice is ablated in the next section.
 
-![results dynamics](figures/results_dynamics.png)
+![results dynamics](figures/results_dynamics.svg)
 
 *Figure 1: Training dynamics for BF16 (orange) and FP8 rollout with router in
 BF16 (blue). Noisy per-step series show a centered rolling median (w=9) over
@@ -76,7 +76,7 @@ suppress the behavioral phase transition, provided the router stays in BF16.
 
 **Rollout performance.**
 
-![rollout performance](figures/rollout_perf.png)
+![rollout performance](figures/rollout_perf.svg)
 
 *Figure 2: Time per output token during generation (ms/token, tool time
 excluded; lower is better). Centered rolling median (w=9) over the raw
@@ -89,16 +89,23 @@ trace.*
 
 FP8 rollout generates each token ~16% faster at matched early-training load.
 The metric is behavior-dependent — it degrades for both arms as trajectories
-shift toward many short model calls (per-call queue/prefill overhead and KV
-traffic grow, none of which FP8 weight-halving accelerates) — so cross-arm
-deltas are only meaningful while the arms remain behaviorally matched; after
+shift toward many short model calls, because a growing share of wall time
+goes to costs FP8 does not accelerate: per-call queueing/scheduling overhead
+and KV-cache attention traffic (the KV cache stays BF16 in both arms).
+Prefill compute does benefit from FP8 GEMMs, but over long multi-turn
+histories prefill itself becomes increasingly KV-bound. Cross-arm deltas are
+therefore only meaningful while the arms remain behaviorally matched; after
 the FP8 arm's later tool-use transition (~step 180) the two curves converge
-as expected. The end-to-end, straggler-inclusive view agrees: over the
-matched-behavior validation bursts (steps 0–40, same 480 AIME tasks, mean
-response lengths within 2%), FP8 completes the burst in a median 178 s vs
-BF16's 202 s (−12%). Batch-completion wall time is the tail-sensitive
-quantity in RL rollout — the slowest streams gate the step — and it moves
-with the per-token speedup.
+as expected.
+
+Validation adds an end-to-end cross-check. Every 10 steps both arms run the
+identical AIME burst — 480 rollouts (30 tasks x 16) submitted together — and
+we time the whole burst from start until the *last* rollout finishes, so
+stragglers count, exactly as they gate a training step. While the two
+policies still behave nearly identically (steps 0–40, mean response lengths
+within 2%), this is an apples-to-apples end-to-end comparison: FP8 finishes
+the burst in a median 178 s vs BF16's 202 s (−12%), consistent with the
+per-token speedup.
 
 ## Ablation: Router Precision
 
@@ -109,7 +116,7 @@ multi-turn setting shows what that routing inconsistency does to the *policy*
 over a longer horizon. Both arms below run identical FP8 W8A8 rollout and
 differ only in router precision.
 
-![router ablation](figures/ablation_router.png)
+![router ablation](figures/ablation_router.svg)
 
 *Figure 3: Router-precision ablation under FP8 rollout: router in BF16 (blue)
 vs router quantized to FP8 (green). Mismatch KL and tool use show a centered
