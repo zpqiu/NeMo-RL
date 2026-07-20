@@ -15,8 +15,8 @@ research/math_with_code/
 │   ├── configs/math_code_harbor_agent.yaml
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
-├── reports/                            # experiment reports (wandb pull + figures + writeup)
-├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
+├── reports/                            # experiment writeups + figures (see Results and Reports)
+├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Bring-up)
 └── experiments/                        # local-only launchers, gitignored (cluster-private paths)
 ```
 
@@ -37,7 +37,7 @@ calls per rollout, then goes through a phase transition around step 130 into a
 heavy tool-iteration regime (~14 calls, 15+ turns, responses growing from
 ~6.5k to ~11k tokens) — and the late accuracy gains ride on that transition.
 
-![BF16 results](figures/results_bf16.svg)
+![BF16 results](reports/fp8_rollout_30b/figures/results_bf16.svg)
 
 *Left: AIME 2025 validation accuracy over training. Right: mean Python tool
 calls per rollout (centered rolling median, w=9, over the raw trace).*
