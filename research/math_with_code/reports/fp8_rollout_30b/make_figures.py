@@ -12,7 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Render the BF16-vs-FP8-rollout report figures from the pulled CSVs."""
+"""Render the report figures in the low-precision-rl-tech-report house style.
+
+Color convention follows that report's figures (validated for CVD):
+orange = BF16 reference, blue = FP8 rollout (recommended config, router BF16),
+green = ablation arm (router quantized to FP8).
+"""
 
 from pathlib import Path
 
@@ -26,22 +31,24 @@ SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#e8e7e3"
-CHAINS = [  # fixed categorical order: slot1 blue, slot2 green, slot3 magenta
-    ("bf16", "BF16", "#2a78d6"),
-    ("fp8_v3", "FP8 v3", "#008300"),
-    ("fp8_v4", "FP8 v4 (router bf16)", "#e87ba4"),
+CHAINS = [  # tech-report convention: orange BF16, blue FP8(main), green ablation
+    ("bf16", "BF16", "#ff7f0e"),
+    ("fp8_v4", "FP8 (router BF16)", "#1f77b4"),
+    ("fp8_v3", "FP8 (router FP8)", "#2ca02c"),
 ]
-FIGURES = [
-    # (column, filename, y-label, title, rolling-window)
-    ("validation/accuracy", "val_accuracy", "AIME 2025 accuracy (30 tasks x 16)",
-     "Validation accuracy", 1),
-    ("train/approx_entropy", "entropy", "approx. policy entropy",
+DYNAMICS_PANELS = [
+    # (column, y-label, panel title, rolling-window)
+    ("validation/accuracy", "accuracy", "Validation accuracy (AIME 2025)", 1),
+    ("train/reward", "reward", "Training reward (rolling median, w=9)", 9),
+    ("train/mean_gen_tokens_per_sample", "tokens / sample",
+     "Response length (rolling median, w=9)", 9),
+    ("train/gen_kl_error", "KL", "Mismatch KL (rolling median, w=9)", 9),
+]
+ABLATION_PANELS = [
+    ("train/approx_entropy", "approx. entropy",
      "Policy entropy (rolling median, w=9)", 9),
-    ("train/gen_kl_error", "gen_kl_error", "KL(train logprobs ‖ gen logprobs)",
-     "Generation logprob bias (rolling median, w=9)", 9),
-    ("train/math_code_harbor_agent/num_tool_calls/mean", "tool_calls",
-     "tool calls per rollout (mean)",
-     "Tool use per rollout (rolling median, w=9)", 9),
+    ("train/math_code_harbor_agent/num_tool_calls/mean", "tool calls / rollout",
+     "Tool use (rolling median, w=9)", 9),
 ]
 
 
@@ -53,47 +60,55 @@ def style_axes(ax):
         ax.spines[side].set_color(GRID)
     ax.grid(True, color=GRID, linewidth=0.7)
     ax.set_axisbelow(True)
-    ax.tick_params(colors=TEXT_SECONDARY, labelsize=9)
+    ax.tick_params(colors=TEXT_SECONDARY, labelsize=8)
+
+
+def plot_panel(ax, frames, column, ylabel, title, window):
+    style_axes(ax)
+    for alias, label, color in CHAINS:
+        df = frames[alias][["step", column]].dropna()
+        if df.empty:
+            continue
+        if window > 1:
+            ax.plot(df["step"], df[column], color=color, linewidth=0.7, alpha=0.22)
+            smooth = df[column].rolling(window, center=True, min_periods=3).median()
+            ax.plot(df["step"], smooth, color=color, linewidth=1.8, label=label)
+        else:
+            ax.plot(df["step"], df[column], color=color, linewidth=1.8,
+                    marker="o", markersize=3.2, label=label)
+    ax.set_xlabel("training step", color=TEXT_SECONDARY, fontsize=9)
+    ax.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=9)
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=10, loc="left")
+
+
+def render(frames, panels, ncols, out_name, figsize):
+    nrows = (len(panels) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, dpi=150)
+    fig.patch.set_facecolor(SURFACE)
+    flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
+    for ax, (column, ylabel, title, window) in zip(flat, panels):
+        plot_panel(ax, frames, column, ylabel, title, window)
+    for ax in flat[len(panels):]:
+        ax.set_visible(False)
+    handles, labels = flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(CHAINS),
+               frameon=False, fontsize=9, labelcolor=TEXT_SECONDARY)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    out = FIG_DIR / out_name
+    fig.savefig(out, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {out}")
 
 
 def main() -> None:
     FIG_DIR.mkdir(exist_ok=True)
     frames = {alias: pd.read_csv(DATA_DIR / f"{alias}.csv") for alias, _, _ in CHAINS}
 
-    for column, stem, ylabel, title, window in FIGURES:
-        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
-        fig.patch.set_facecolor(SURFACE)
-        style_axes(ax)
-        for alias, label, color in CHAINS:
-            df = frames[alias][["step", column]].dropna()
-            if df.empty:
-                continue
-            if window > 1:
-                ax.plot(df["step"], df[column], color=color, linewidth=0.8, alpha=0.25)
-                smooth = df[column].rolling(window, center=True, min_periods=3).median()
-                ax.plot(df["step"], smooth, color=color, linewidth=2, label=label)
-                y_end = smooth.dropna().iloc[-1]
-            else:
-                ax.plot(df["step"], df[column], color=color, linewidth=2,
-                        marker="o", markersize=4, label=label)
-                y_end = df[column].iloc[-1]
-            ax.annotate(label, (df["step"].iloc[-1], y_end),
-                        xytext=(6, 0), textcoords="offset points",
-                        color=color, fontsize=9, va="center")
-        ax.set_xlabel("training step", color=TEXT_SECONDARY, fontsize=10)
-        ax.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=10)
-        ax.set_title(title, color=TEXT_PRIMARY, fontsize=12, loc="left")
-        ax.legend(frameon=False, fontsize=9, labelcolor=TEXT_SECONDARY)
-        ax.margins(x=0.12)
-        fig.tight_layout()
-        out = FIG_DIR / f"{stem}.png"
-        fig.savefig(out, facecolor=SURFACE)
-        plt.close(fig)
-        print(f"wrote {out}")
+    render(frames, DYNAMICS_PANELS, 2, "training_dynamics.png", (9.6, 6.4))
+    render(frames, ABLATION_PANELS, 2, "ablation_router.png", (9.6, 3.6))
 
-    # Throughput / accuracy summary for the report tables.
-    print("\n| chain | best val acc | last val acc (step) | median step time (s) "
-          "| median exposed gen (s) | median gen tok/s |")
+    print("\n| configuration | best val acc | last val acc (step) | median step "
+          "time (s) | median exposed gen (s) | median gen tok/s |")
     print("|---|---|---|---|---|---|")
     for alias, label, _ in CHAINS:
         df = frames[alias]
