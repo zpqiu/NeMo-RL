@@ -16,8 +16,7 @@ research/math_with_code/
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
 ├── reports/                            # experiment writeups + figures (see Results and Reports)
-├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Bring-up)
-└── experiments/                        # local-only launchers, gitignored (cluster-private paths)
+└── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Bring-up)
 ```
 
 ## Results
@@ -115,9 +114,6 @@ The 8B config wants 3 nodes x 4 GPUs (2 generation + 1 training, see the
 yaml's cluster block); the 30B config wants 4 nodes. `WANDB_API_KEY` in the
 environment enables W&B logging as usual.
 
-`experiments/` is a local-only (gitignored) convenience layer over exactly
-this flow — launchers there embed cluster-private account and storage paths.
-
 ## Data
 
 Nothing under `responses_api_agents/harbor_agent/data/` is committed — the
@@ -206,12 +202,12 @@ commit. This project carries a forked copy of the entire
 mechanisms:
 
 1. **Server discovery** — nemo-gym checks `Path.cwd()/<server_rel_path>` before
-   its install location (`nemo_gym/cli.py`). `experiments/exp.sh` creates the
-   repo-root symlink `responses_api_agents ->
-   research/math_with_code/responses_api_agents` on every submit so the fork
-   wins; `config_paths` resolution works the same way. The symlink is a runtime
-   artifact (listed in `.git/info/exclude`, never committed) — recreate it with
-   the same `ln -sfn` if you launch without exp.sh.
+   its install location (`nemo_gym/cli.py`). The repo-root symlink
+   `responses_api_agents -> research/math_with_code/responses_api_agents`
+   (created in the Bring-up launch step) makes the fork win; `config_paths`
+   resolution works the same way. The symlink is a runtime artifact — keep it
+   out of git (e.g. via `.git/info/exclude`) and recreate it with the same
+   `ln -sfn` on a fresh clone.
 2. **Python imports** — the editable nemo-gym install maps
    `responses_api_agents.*` to the pristine submodule via a setuptools
    meta-path finder. PathFinder consults `sys.path` first, so the fork's
