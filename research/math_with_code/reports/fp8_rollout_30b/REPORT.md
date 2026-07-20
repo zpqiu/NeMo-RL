@@ -12,7 +12,9 @@
 **Training Setup.** We extend the tech report's FP8 W8A8 linear-rollout
 evaluation from single-turn math RL to a multi-turn agentic task: boxed-answer
 math problems where the policy iterates Python code in an isolated per-trial
-container (nemo-gym Harbor harness, `MathCodeHarborAgent`, max 4 agent steps).
+container (nemo-gym Harbor harness, `MathCodeHarborAgent`, up to 16
+model-call steps per rollout — each step may execute multiple Python tool
+calls, and the loop ends early once the model answers without one).
 Model: Qwen3-30B-A3B-Instruct-2507 (MoE, non-thinking). Framework: NeMo-RL
 async GRPO on 4 GB200 nodes (4 GPUs/node) — 2 generation nodes (vLLM TP1, 8
 replicas) and 2 training nodes (Megatron-Core TP4 x EP8), non-colocated,
