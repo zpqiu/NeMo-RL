@@ -37,14 +37,12 @@ adds two behavioral metrics with no single-turn counterpart: (v) *policy
 entropy* and (vi) *tool calls per rollout* — the task exhibits a phase
 transition into heavy tool use, and whether that transition fires is the most
 sensitive indicator of rollout-precision side effects we observed. Rollout
-speed is measured by (vii) the *per-stream generation rate*
-R = mean generated tokens per model call ÷ mean model-call wall-clock seconds
-(the batch-mean ratio equals Σtokens/Σseconds; the denominator is the HTTP
-wall clock covering vLLM queueing, prefill, and decode, excluding tool
-execution), which measures model-serving speed at matched load without baking
-concurrency into the number; and (viii) *fleet generation throughput*
-(global rollout tokens/s across all engines during training, which includes
-async overlap and buffer dynamics and is correspondingly noisier).
+speed is measured by (vii) *time per output token* (ms/token) during
+generation, as in the tech report: mean model-call wall-clock seconds ÷ mean
+generated tokens per call (the batch-mean ratio equals Σseconds/Σtokens; the
+wall clock is the HTTP call covering vLLM queueing, prefill, and decode,
+excluding tool execution). It measures per-request serving speed at matched
+load — lower is better — without baking concurrency into the number.
 
 ## Results: FP8 W8A8 Rollout with Token-Level TIS
 
@@ -80,24 +78,27 @@ suppress the behavioral phase transition, provided the router stays in BF16.
 
 ![rollout performance](figures/rollout_perf.png)
 
-*Figure 2: Rollout speed. Left: per-stream generation rate R (tokens/s per
-stream, tool time excluded). Right: fleet generation throughput. Centered
-rolling median (w=9) over the raw trace.*
+*Figure 2: Time per output token during generation (ms/token, tool time
+excluded; lower is better). Centered rolling median (w=9) over the raw
+trace.*
 
-| window | BF16 R | FP8 R | Δ |
+| window | BF16 | FP8 | Δ |
 |---|---|---|---|
-| steps 10–60 (early behavior: 1–2 model calls, ~6.5k-token trajectories) | 77.5 | 92.6 | **+19.4%** |
-| steps 150+ (late behavior: heavy tool use, ~12k-token trajectories) | 62.1 | 70.6 | +13.7% |
+| steps 10–60 (early behavior: 1–2 model calls, ~6.5k-token trajectories) | 12.9 ms/token | 10.8 ms/token | **−16.2%** |
+| steps 150+ (late behavior: heavy tool use, ~12k-token trajectories) | 16.1 ms/token | 14.2 ms/token | −12.1% |
 
-Per-stream rate R isolates the model-serving speedup: FP8 serves each stream
-~19% faster at matched early-training load. R is itself behavior-dependent —
-it declines for both arms as trajectories shift toward many short model calls
-(per-call queue/prefill overhead and KV traffic grow, none of which FP8
-weight-halving accelerates) — so cross-arm deltas are only meaningful while
-the arms remain behaviorally matched; after the FP8 arm's later tool-use
-transition (~step 180) the two curves converge as expected. Fleet throughput
-(right panel) reflects the same picture through async-overlap noise: FP8
-leads by ~5% early and the gap closes once behavior diverges.
+FP8 rollout generates each token ~16% faster at matched early-training load.
+The metric is behavior-dependent — it degrades for both arms as trajectories
+shift toward many short model calls (per-call queue/prefill overhead and KV
+traffic grow, none of which FP8 weight-halving accelerates) — so cross-arm
+deltas are only meaningful while the arms remain behaviorally matched; after
+the FP8 arm's later tool-use transition (~step 180) the two curves converge
+as expected. The end-to-end, straggler-inclusive view agrees: over the
+matched-behavior validation bursts (steps 0–40, same 480 AIME tasks, mean
+response lengths within 2%), FP8 completes the burst in a median 178 s vs
+BF16's 202 s (−12%). Batch-completion wall time is the tail-sensitive
+quantity in RL rollout — the slowest streams gate the step — and it moves
+with the per-token speedup.
 
 ## Ablation: Router Precision
 
