@@ -54,3 +54,4 @@ code_snapshots*/
 
 # EAGLE-3 track: local-only until the online-drafter phase is ready to publish
 /research/math_with_code/eagle3/
+/research/math_with_code/configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_eagle3_offline.yaml
