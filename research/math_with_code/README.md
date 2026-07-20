@@ -185,8 +185,8 @@ for diagnosis and are worth purging occasionally to protect shared-fs inodes.
   destined to merge into) the single-turn `low-precision-rl-tech-report`:
   BF16 reference curves, FP8 (router BF16) tracking-or-beating them, and the
   router-precision ablation showing quantized routing suppresses the task's
-  tool-use phase transition. Data pull + figure scripts are alongside and
-  re-runnable against wandb.
+  tool-use phase transition. Curves are stitched from the wandb chains in
+  `nv-welcome/grpo-math-with-code`.
 
 ## Residual diffs outside this directory
 
