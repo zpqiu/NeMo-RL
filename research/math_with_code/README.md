@@ -20,6 +20,31 @@ research/math_with_code/
 └── experiments/                        # local-only launchers, gitignored (cluster-private paths)
 ```
 
+## Results
+
+Reference run: Qwen3-30B-A3B-Instruct-2507 trained with this recipe (BF16,
+async GRPO, ~220 steps). Validation is AIME 2025, 30 tasks x 16 rollouts each:
+
+| Qwen3-30B-A3B-Instruct-2507 | AIME 2025 |
+|---|---|
+| Reported ([model card](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), no tool) | 61.3 |
+| Step 0 on this harness (with the Python tool, before training) | 64.2 |
+| After training (best, step 220) | **85.8** |
+
+The gain is not just score: the model *learns the tool*. At step 0 rollouts
+barely touch Python (~0.2 calls each); training grows steady tool use to ~7
+calls per rollout, then goes through a phase transition around step 130 into a
+heavy tool-iteration regime (~14 calls, 15+ turns, responses growing from
+~6.5k to ~11k tokens) — and the late accuracy gains ride on that transition.
+
+![BF16 results](figures/results_bf16.svg)
+
+*Left: AIME 2025 validation accuracy over training. Right: mean Python tool
+calls per rollout (centered rolling median, w=9, over the raw trace).*
+
+See [`reports/`](reports/) for the full experiment writeups (FP8 rollout A/B
+and the router-precision ablation).
+
 ## Bring-up
 
 This assumes you have already run a single-turn GRPO job with NeMo-RL on your
