@@ -15,6 +15,7 @@ research/math_with_code/
 │   ├── configs/math_code_harbor_agent.yaml
 │   └── data/math_code/                 #   generated datasets (gitignored)
 ├── configs/                            # NeMo-RL training config
+├── reports/                            # experiment reports (wandb pull + figures + writeup)
 ├── eagle3/                             # EAGLE-3 speculative-decoding track (drafter smoke test)
 ├── docker/                             # SIF build, only for def changes/new arch — prefer the prebuilt pull (see Running)
 ├── experiments/                        # local-only launchers, gitignored (cluster-private paths)
@@ -176,6 +177,16 @@ dataset name, local parquet shards, or Dataset Server JSON, plus
 Harbor trial outputs land in `responses_api_agents/harbor_agent/jobs/`
 (gitignored). Successful trials are deleted automatically; failed ones are kept
 for diagnosis and are worth purging occasionally to protect shared-fs inodes.
+
+## Reports
+
+- [`reports/fp8_rollout_30b/REPORT.md`](reports/fp8_rollout_30b/REPORT.md) —
+  FP8 rollout for multi-turn agentic RL on the 30B MoE, structured after (and
+  destined to merge into) the single-turn `low-precision-rl-tech-report`:
+  BF16 reference curves, FP8 (router BF16) tracking-or-beating them, and the
+  router-precision ablation showing quantized routing suppresses the task's
+  tool-use phase transition. Curves are stitched from the wandb chains in
+  `nv-welcome/grpo-math-with-code`.
 
 ## Residual diffs outside this directory
 
