@@ -236,6 +236,13 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       kv_cache_dtype: "auto"
+      # Attach vLLM's PrometheusStatLogger and sample it on the model-owner
+      # actor: surfaces per-request queue/prefill/decode/TTFT window means
+      # (train/vllm/request_*_mean_s) used to decompose per-call fixed cost
+      # vs decode cost in the FP8 rollout analysis. Overhead is a 0.5s-interval
+      # reader thread per engine — negligible.
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
       expose_http_server: true
       skip_tokenizer_init: false
       enable_thinking: false

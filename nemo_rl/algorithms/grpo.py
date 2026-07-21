@@ -4423,6 +4423,15 @@ def async_grpo_train(
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
+                    # Flat window-mean scalars (queue/prefill/decode/TTFT per
+                    # request); popped so the logger's per-worker timeline
+                    # merge only sees the timeline-shaped entries.
+                    request_time_means = generation_logger_metrics.pop(
+                        "request_time_means", {}
+                    )
+                    metrics.update(
+                        {f"vllm/{k}": v for k, v in request_time_means.items()}
+                    )
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
