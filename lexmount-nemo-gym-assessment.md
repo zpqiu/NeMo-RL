@@ -128,6 +128,77 @@ Lexmount（云端隔离浏览器基础设施，对标 BrowserBase）希望把远
 5. 立项 nemo_gym×VLM 多模态回传（阶段二关键路径，2–4 周）。
 6. 答复 R1（native 路径可接受）/R2（验收标准按第 7 节阶段划分）及 A1–A4（入口/egress/资源/secrets 按集群实际情况）。
 
+## 9. 参考：与 ServiceNow/BrowserGym 的关系
+
+结论：**只在"可交互浏览器环境"层面类似，不能互相替代，本质是互补的两层。**
+
+| | ServiceNow/BrowserGym | Lexmount PR #1865 |
+|---|---|---|
+| 本质 | benchmark 聚合框架（Gymnasium 接口） | 单个自研环境（Gym resources server） |
+| 任务资产 | 9 个套件开箱即用：MiniWoB++、WebArena(+Verified)、VisualWebArena、WorkArena、AssistantBench、WebLINX、OpenApps、TimeWarp | 5 条离线示例任务，无 benchmark 套件 |
+| Reward | 各套件自带成熟任务级 reward | 4 种规则 key |
+| 观察空间 | DOM / AXTree / 截图可配 | 纯文本元素列表 |
+| 动作空间 | 打磨过的原语（click(bid)/fill/scroll/tab/python action） | 5 工具（无 scroll） |
+| 浏览器运行时 | 本地 Playwright，绑死训练进程旁 | 可插拔：本地 / Lexmount 云端 off-node |
+| 训练接口 | Gymnasium 同步 API，接 NeMo-RL 需再包装 | NeMo-Gym Responses API 原生 |
+| 维护 | 活跃（v0.14.3, 2026-01, 1.3k star） | Draft PR |
+
+要点：
+
+- **不能替代**：BrowserGym 的核心资产是 9 套件的任务+reward+标准化观察/动作空间（学术可比性锚点），Lexmount PR 在这层积累为零。且 Issue #644 字面诉求就是"integrate Browser Gym"，PR 交付的是自研环境——回应了精神、没回应字面。
+- **反向也不能**：BrowserGym 没有浏览器 off-node 概念，浏览器就是训练节点旁的本地 Playwright——而这正是 Lexmount 的全部价值主张。
+- **理想终态 = "BrowserGym on Lexmount"**：按 Gym external benchmark 规范在 agent 层包装 BrowserGym（先复现原 repo 数字、再复现 Gym 集成后数字），底层浏览器换成 Lexmount CDP（BrowserGym 底层即 Playwright，`connect_over_cdp` 理论上可直接对接）。同时满足 #644 字面需求与 Lexmount 价值展示，自带 MiniWoB++/WebArena 任务与规则 reward（覆盖 M0b 需求）。
+- 待验证风险：各套件 reset/状态预置逻辑在远程浏览器上的兼容性；VisualWebArena 截图（CDP 支持，问题不大）；Gymnasium 同步 API 的高并发吞吐形态。
+
+## 10. 第二次沟通问题清单（2026-07-23）
+
+> 目标：把"能启动"变成"可被评审"。每个问题都附我们已掌握的事实（不必现场重新争论）和期望的答案形态。
+
+### Q1 训练数据与 recipe reference —— 做 browser-use 任务验证，可用的训练数据有哪些？
+
+**我们已知**：WebVoyager 600 条（无 golden answer、任务写死 2024 日期已过期漂移、reward 靠 judge）；PR 只有 5 条离线示例；MiniWoB++ 出过 0.162→0.315 但接入代码不在任何公开材料；WebArena-Lite 有自托管脚本但只用于 eval、runner 仅支持本地 Playwright。
+
+要问的：
+1. 你们计划用于**训练**（不是 eval）的数据集清单和优先级？各自配套的 reward 方案？
+2. MiniWoB++ 那条 0.162→0.315 的**完整 recipe**（config + 数据 + 代码版本 + reward）能否交付/贡献到 PR 线，让我们独立复现？
+3. WebArena-Lite 若做训练，任务集用什么（原 812 模板去除 Lite 测试集？WebRL 指令集？），evaluator 怎么接进 `verify()`？
+4. WebVoyager 的任务过期问题你们如何处理？是否已有可解性筛查结果？数据再分发 license？
+5. 是否考虑过"BrowserGym on Lexmount"路线（见第 9 节）——做 BrowserGym 的 Lexmount backend，任务与 reward 直接继承 9 个套件？
+
+**期望答案形态**：每个候选数据集给出（任务数、reward 类型、已验证的训练 config、可复现 artifact 链接）。
+
+### Q2 截图回传依赖 —— 你们的 recipe 依赖 gym 回传截图吗？
+
+**我们已知（已核实）**：他们现有全部代码（PR + lab）零截图能力，所有 recipe 都是纯文本 DOM 观察 → **NeMo-RL 当前 nemo_gym 不支持图像回传这一点，不阻塞复现他们的任何已有结果**。
+
+要问的：
+1. 确认：你们所有已验证/计划中的 recipe 都不依赖截图回传？roadmap 里哪个阶段需要视觉观察？
+2. 是否接受我们的中间态设计：**rollout 纯 DOM + 仅 verify 时截图给多模态 judge**（图像只进 judge、不进训练管线）？env 侧的截图抓取（CDP screenshot）你们负责实现吗？
+3. 若走到 VLM 阶段：env 侧截图观察（分辨率/混合观察/历史帧策略）你们是否愿意设计实现？NeMo-RL 侧多模态回传由我们排期（2–4 周）。
+
+### Q3 两条技术线 —— PR 和 lab 是不同的实验，你们想让我们验证哪个？
+
+**我们已知**：PR 线（simple_agent + 规则 reward，从未训练过）与 lab 线（verifiers_agent + Stagehand + gpt-5.5 judge，1.7B 已跑通）互不相同，宣传数字来自后者、不能佐证前者。
+
+要问的：
+1. 你们希望 NVIDIA 集群验证的到底是哪条线？**我们的立场：上游可审的只有 PR 线，建议以 PR 线为准补训练验证**；lab 线的工程经验（session 超时处理、infrastructure 失败分桶）应回流进 PR。
+2. 两条线是否有合流计划？Stagehand/verifiers 依赖在上游化时如何处理？
+3. 硬性要求：rebase 到 NeMo-RL main、去掉全部 v0.6 monkey-patch（分组问题 main 已修复）；judge 不得走 dmxapi 第三方中转。
+4. PR 按本文档 3.1 的 7 条意见修改 + 补 Gym 合入规范的 baselining，时间线？
+
+### Q4 并发能力 —— Lexmount 能支撑多大并发的训练？
+
+**我们已知**：只验证过 **8 并发**（session create 60s 超时、一个 64 轨迹 step 分 8 波收）；正式多节点训练需要几百并发；一次 150 步训练 ≈ 万级 session。
+
+要问的：
+1. 单项目/单账号的 session 并发配额上限？256 / 512 / 1024 并发下 session create 的 p95 延迟实测数据？
+2. 数天训练窗口的会话成功率 SLA？失败会话的事后审计能力？
+3. Region 布局（访问美国站点的推荐 region）？训练量级（几十万次页面访问）下的反爬/封禁风险评估？
+4. 计费：万级 session/run、每条数分钟，单价和承担方？
+5. 云端浏览器访问客户私有站点（自托管 WebArena 站群）的方案：隧道/IP 白名单/专线？——决定自托管 benchmark 能否做 Lexmount A/B 对照。
+
+**期望答案形态**：并发-延迟-成功率的实测曲线（哪怕小规模），而非"理论上支持"。这直接决定可用 recipe 的 `num_prompts × group_size` 上限与 rollout 波数。
+
 ---
 
-*来源：PR #1865 diff、lexmount-browser-lab@main（2026-07-14）、对方简报（2026-07-14）、NeMo-RL main 与 Gym submodule 代码核查。所有"已核实"结论均对应具体文件行号，见正文。*
+*来源：PR #1865 diff、lexmount-browser-lab@main（2026-07-14）、对方简报（2026-07-14）、ServiceNow/BrowserGym README（2026-07-21）、NeMo-RL main 与 Gym submodule 代码核查。所有"已核实"结论均对应具体文件行号，见正文。*
