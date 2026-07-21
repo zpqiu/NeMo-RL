@@ -324,7 +324,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from vllm.v1.metrics.reader import (
+            Counter,
+            Gauge,
+            Histogram,
+            get_metrics_snapshot,
+        )
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -349,6 +354,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        # Cumulative (sum, count) snapshots of vLLM's per-request latency
+        # histograms; window mean = (last.sum - first.sum) / (last.count -
+        # first.count). Lets the trainer decompose per-call wall time into
+        # queue / prefill / decode without per-request logging overhead.
+        self.request_time_histograms: dict[str, list[tuple[float, int]]] = {}
+        request_time_histogram_names = {
+            "vllm:request_queue_time_seconds",
+            "vllm:request_prefill_time_seconds",
+            "vllm:request_decode_time_seconds",
+            "vllm:request_inference_time_seconds",
+            "vllm:time_to_first_token_seconds",
+            "vllm:e2e_request_latency_seconds",
+        }
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -370,6 +388,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
+                            elif isinstance(m, Histogram):
+                                if m.name in request_time_histogram_names:
+                                    self.request_time_histograms.setdefault(
+                                        m.name, []
+                                    ).append((float(m.sum), int(m.count)))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -398,6 +421,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "request_time_histograms": copy.deepcopy(
+                    self.request_time_histograms
+                ),
             }
         return metric
 
@@ -410,6 +436,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.request_time_histograms = {}
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()

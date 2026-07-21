@@ -20,6 +20,7 @@ from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
+    Iterable,
     Optional,
     Union,
 )
@@ -1024,6 +1025,14 @@ class VllmGeneration(GenerationInterface):
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
 
+        request_time_means = compute_request_time_means(
+            stats.get("request_time_histograms") for stats in results if stats
+        )
+        if request_time_means:
+            # Consumed (and popped) by the trainer as flat scalars; kept out of
+            # the per-worker timeline dicts the logger merge expects.
+            vllm_logger_metrics["request_time_means"] = request_time_means  # type: ignore[assignment]
+
         return vllm_logger_metrics
 
     def clear_vllm_logger_metrics(self) -> None:
@@ -1085,3 +1094,42 @@ class VllmGeneration(GenerationInterface):
         return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
             "kv_cache_dtype"
         ].startswith("fp8")
+
+
+def compute_request_time_means(
+    per_worker_histograms: Iterable[Optional[dict[str, list[tuple[float, int]]]]],
+) -> dict[str, float]:
+    """Reduce per-worker vLLM latency-histogram snapshots to window means.
+
+    Each worker contributes cumulative ``(sum, count)`` snapshots per histogram
+    (e.g. ``vllm:request_queue_time_seconds``) sampled over the current metrics
+    window. The window delta per worker is ``last - first``; summing deltas
+    across workers and dividing gives the fleet-wide mean seconds per request
+    for that window.
+
+    Returns:
+        Mapping like ``{"request_queue_time_mean_s": 3.2, ...}`` — one entry
+        per histogram that observed at least one request in the window.
+    """
+    delta_sums: dict[str, float] = {}
+    delta_counts: dict[str, int] = {}
+    for histograms in per_worker_histograms:
+        if not histograms:
+            continue
+        for name, snapshots in histograms.items():
+            if len(snapshots) < 2:
+                continue
+            (first_sum, first_count), (last_sum, last_count) = (
+                snapshots[0],
+                snapshots[-1],
+            )
+            if last_count <= first_count:
+                continue
+            key = name.removeprefix("vllm:").removesuffix("_seconds")
+            delta_sums[key] = delta_sums.get(key, 0.0) + (last_sum - first_sum)
+            delta_counts[key] = delta_counts.get(key, 0) + (last_count - first_count)
+    return {
+        f"{key}_mean_s": delta_sums[key] / delta_counts[key]
+        for key in delta_sums
+        if delta_counts[key] > 0
+    }
