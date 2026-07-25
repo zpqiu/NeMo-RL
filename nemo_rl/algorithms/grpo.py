@@ -3660,6 +3660,14 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
+            # Speculative-decoding counters are cumulative engine-wide, so the
+            # per-step delta is taken over the training window and closed before
+            # validation runs (below) to keep val generations out of it. Async
+            # collection is continuous, so this window is wall-clock scoped
+            # rather than tied to a single generate() call.
+            if hasattr(policy_generation, "snapshot_step_metrics"):
+                policy_generation.snapshot_step_metrics()
+
             with timer.time("total_step_time"):
                 ray.get(trajectory_collector.raise_if_failed.remote())
                 # Sample trajectories from replay buffer
@@ -4012,6 +4020,12 @@ def async_grpo_train(
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
 
+                # Close the spec-decode window before validation so the reported
+                # acceptance reflects only training-distribution rollouts.
+                gen_step_metrics = {}
+                if hasattr(policy_generation, "get_step_metrics"):
+                    gen_step_metrics = policy_generation.get_step_metrics()
+
                 # Validation
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
@@ -4090,6 +4104,7 @@ def async_grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                metrics.update(gen_step_metrics)
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(penalty_metrics)
                 for k, v in metrics.items():

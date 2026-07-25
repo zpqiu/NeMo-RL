@@ -1,0 +1,30 @@
+# EAGLE-3 track, Phase 2 CONTROL: frozen drafter, policy trains normally.
+#
+# Byte-identical to the *_eagle3_online arm except policy.draft.enabled=false,
+# so no draft.* weights are exported and refit leaves the vLLM drafter at its
+# initial checkpoint while the policy keeps updating. This is the staleness
+# baseline: if acceptance decays here but holds in the online arm, online draft
+# training earns its cost.
+#
+# Sequence packing is kept OFF (matching the treatment arm, where the online
+# draft path requires it) so the pair differs only in drafter training.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+policy:
+  draft:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: "/lustre/fsw/general_sa/alexq/models/eagle3-qwen3-30ba3b-2507-specforge-maxpos40960"
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+
+logger:
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-eagle3-frozen"

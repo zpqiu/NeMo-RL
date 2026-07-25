@@ -1,0 +1,46 @@
+# EAGLE-3 track, Phase 2 TREATMENT: draft model trained online with the policy.
+#
+# Phase 1 (offline drafter, jobs 2391987/2391988) established that speculation
+# pays at our operating point: +82% per-stream at conc512/temp=1.0, accuracy
+# parity, acceptance 2.18-2.89. Phase 2 asks the follow-on question that only
+# matters for RL: as the policy moves, does a FROZEN drafter decay, and does
+# training the drafter alongside the policy hold acceptance up?
+#
+# This is the treatment arm (drafter trained). Pair it with the *_eagle3_frozen
+# arm, which is byte-identical except policy.draft.enabled=false, so the only
+# difference is whether draft.* weights are trained and refit. Primary readout
+# is vllm/spec_acceptance_length vs step (now logged on the async path), with
+# draft_loss and val:accuracy as the supporting series.
+#
+# Sequence packing is OFF in both arms (online draft training asserts against it
+# in lm_policy.py). That costs MoE permute-fusion throughput, so it is held
+# common-mode across the pair rather than corrected for; e2e step time here is
+# NOT comparable to the packed Phase-1 runs.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+policy:
+  draft:
+    enabled: true
+    # Same maxpos-patched SpecForge checkpoint the vLLM drafter starts from, so
+    # trainer-owned and engine-side drafters begin identical and only diverge
+    # through training. (Phase 1: the stock ckpt's max_position_embeddings=2048
+    # collapses acceptance past position 2048.)
+    model_name: "/lustre/fsw/general_sa/alexq/models/eagle3-qwen3-30ba3b-2507-specforge-maxpos40960"
+    loss_weight: 1.0
+
+  # Required by the online draft path (lm_policy.py asserts). Legal here only
+  # because context_parallel_size=1; CP>1 would force packing back on.
+  sequence_packing:
+    enabled: false
+
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+
+logger:
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-eagle3-online"
