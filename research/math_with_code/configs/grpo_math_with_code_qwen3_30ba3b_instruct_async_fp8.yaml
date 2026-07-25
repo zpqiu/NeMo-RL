@@ -39,6 +39,14 @@ policy:
       # gate_proj parameters; lm_head is not quantized by vLLM's Fp8Config.
       quantization_ignored_layer_kws: ["mlp.gate"]
 
+checkpointing:
+  # Own tree. Inheriting the base config's checkpoint_dir means this arm
+  # silently resumes from whatever the BF16 arm last wrote there instead of
+  # starting at step 0 — NeMo-RL auto-resumes from any checkpoint present in
+  # checkpoint_dir, which is how job 2444430 lost its step-0 readout.
+  checkpoint_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-fp8/checkpoints"
+
 logger:
+  log_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-fp8/logs"
   wandb:
     name: "qwen3-30ba3b-instruct-mathcode-async-fp8"
