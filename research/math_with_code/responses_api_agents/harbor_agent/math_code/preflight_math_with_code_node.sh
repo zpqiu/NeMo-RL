@@ -20,7 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 HARBOR_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd -- "$HARBOR_ROOT/../.." && pwd)"
-VENV_ROOT="${NEMO_GYM_VENV_DIR:?export NEMO_GYM_VENV_DIR to the shared Gym venv root}"
+source "$PROJECT_ROOT/math_code_paths.sh"
+VENV_ROOT="$NEMO_GYM_VENV_DIR"
 HARBOR_PYTHON="$VENV_ROOT/responses_api_agents/harbor_agent/.venv/bin/python"
 TASK_DIR="${MATH_CODE_PREFLIGHT_TASK_DIR:-$HARBOR_ROOT/data/math_code/aime_2024/task_000000}"
 MATH_CONFIG="$HARBOR_ROOT/configs/math_code_harbor_agent.yaml"
@@ -36,20 +37,37 @@ fail() {
 }
 
 [[ -x "$HARBOR_PYTHON" ]] || fail "Harbor Python is not executable: $HARBOR_PYTHON"
-[[ -f "$MATH_CONFIG" ]] || fail "current math-code config is missing: $MATH_CONFIG (check the /opt/nemo-rl live mount)"
-[[ -f "$MATH_AGENT" ]] || fail "current math-code agent is missing: $MATH_AGENT (check the /opt/nemo-rl live mount)"
+[[ -f "$MATH_CONFIG" ]] || fail "current math-code config is missing: $MATH_CONFIG (check the repo mount)"
+[[ -f "$MATH_AGENT" ]] || fail "current math-code agent is missing: $MATH_AGENT (check the repo mount)"
 [[ -d "$TASK_DIR" ]] || fail "task directory is missing: $TASK_DIR"
+[[ -f "$TASK_DIR/task.toml" ]] || fail "task TOML is missing: $TASK_DIR/task.toml"
+[[ -c /dev/fuse ]] || fail "/dev/fuse is unavailable; add /dev/fuse:/dev/fuse to the Pyxis container mounts"
 
 # nemo-gym resolves server dirs cwd-first; without the repo-root symlink it
 # silently falls back to the pristine Gym submodule's harbor_agent instead of
 # this overlay (see README "How the overlay fork works").
 REPO_ROOT="$(cd -- "$PROJECT_ROOT/../.." && pwd)"
+[[ -e "$REPO_ROOT/responses_api_agents" ]] || \
+    fail "repo-root responses_api_agents link is missing; run: ln -sfn research/math_with_code/responses_api_agents $REPO_ROOT/responses_api_agents"
 OVERLAY_DIR="$(readlink -f "$PROJECT_ROOT/responses_api_agents")"
 [[ "$(readlink -f "$REPO_ROOT/responses_api_agents")" == "$OVERLAY_DIR" ]] || \
     fail "repo-root responses_api_agents does not point at the overlay; run: ln -sfn research/math_with_code/responses_api_agents $REPO_ROOT/responses_api_agents"
 
-SIF_PATH="$(sed -n 's/^docker_image = "\(.*\)"/\1/p' "$TASK_DIR/task.toml")"
-[[ -n "$SIF_PATH" && -r "$SIF_PATH" ]] || fail "shared SIF is missing or unreadable: $SIF_PATH"
+SIF_PATH="$(PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$HARBOR_PYTHON" - "$TASK_DIR/task.toml" <<'PY'
+import sys
+import tomllib
+
+from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import (
+    resolve_math_code_sif_path,
+)
+
+with open(sys.argv[1], "rb") as handle:
+    image = tomllib.load(handle)["environment"]["docker_image"]
+print(resolve_math_code_sif_path(image))
+PY
+)"
+[[ -r "$SIF_PATH" ]] || fail "shared SIF is missing or unreadable: $SIF_PATH"
 
 command -v singularity >/dev/null || fail "singularity is not installed in the training container"
 
@@ -62,11 +80,16 @@ import nemo_gym
 import pydantic
 import ray
 
+from responses_api_agents.harbor_agent.custom_agents.math_code_harbor_agent import MathCodeHarborAgent
+from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import SingularityEnvironment
+
 print(
     f"python={sys.version.split()[0]} machine={platform.machine()} "
     f"harbor={harbor.__file__} nemo_gym={nemo_gym.__file__} "
     f"ray={ray.__version__} pydantic={pydantic.__version__}"
 )
+print(f"agent={MathCodeHarborAgent.__module__}.{MathCodeHarborAgent.__name__}")
+print(f"environment={SingularityEnvironment.__module__}.{SingularityEnvironment.__name__}")
 PY
 
 singularity exec --cleanenv "$SIF_PATH" python3 - <<'PY'

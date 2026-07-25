@@ -14,21 +14,36 @@
 # limitations under the License.
 # Build and smoke-test the math-code SIF from inside the NeMo-RL sqsh.
 #
-# Most users should NOT run this: pull the prebuilt aarch64 image instead —
-#     apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
-# Build only when changing math_code_aarch64.def or targeting another arch.
+# Most users should pull a matching prebuilt image. Build this image when
+# changing its definition or targeting an architecture without a published SIF.
 set -euo pipefail
-
-: "${SIF_OUT:?Set SIF_OUT to the persistent output .sif path}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+source "$PROJECT_ROOT/math_code_paths.sh"
+SIF_OUT="${SIF_OUT:-$MATH_CODE_SIF_PATH}"
 export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-/tmp/apptainer-cache}"
 export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-/tmp/apptainer-tmp}"
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$(dirname "$SIF_OUT")"
 
 echo "Build host architecture: $(uname -m)"
-test "$(uname -m)" = "aarch64"
+MATH_CODE_ARCH="${MATH_CODE_ARCH:-$(uname -m)}"
+test "$MATH_CODE_ARCH" = "$(uname -m)" || {
+    echo "MATH_CODE_ARCH=$MATH_CODE_ARCH does not match build host $(uname -m)" >&2
+    exit 1
+}
+case "$MATH_CODE_ARCH" in
+    aarch64|x86_64) ;;
+    *)
+        echo "Unsupported architecture: $MATH_CODE_ARCH" >&2
+        exit 1
+        ;;
+esac
+DEF_FILE="$SCRIPT_DIR/math_code_${MATH_CODE_ARCH}.def"
+test -f "$DEF_FILE" || {
+    echo "Missing definition file for $MATH_CODE_ARCH: $DEF_FILE" >&2
+    exit 1
+}
 command -v apptainer
 command -v singularity
 readlink -f "$(command -v singularity)"
@@ -43,11 +58,11 @@ fi
 echo "Effective uid: $(id -u); fakeroot args: ${fakeroot_args[*]:-(none)}"
 
 build_id="${SLURM_JOB_ID:-manual-$$}"
-tmp_sif="/tmp/math-code-py312-aarch64-${build_id}.sif"
+tmp_sif="/tmp/math-code-py312-${MATH_CODE_ARCH}-${build_id}.sif"
 smoke_root="/tmp/hb-smoke-${build_id}"
 trap 'rm -rf "$tmp_sif" "$smoke_root"' EXIT
 
-singularity build "${fakeroot_args[@]}" "$tmp_sif" "$SCRIPT_DIR/math_code_aarch64.def"
+singularity build "${fakeroot_args[@]}" "$tmp_sif" "$DEF_FILE"
 
 # Exercise the exact isolation flags used by Gym's custom environment, plus
 # the persistent Python tool transport and verifier import.
@@ -64,6 +79,7 @@ singularity exec \
     "${fakeroot_args[@]}" \
     --containall \
     --pid \
+    --env "MATH_CODE_ARCH=$MATH_CODE_ARCH" \
     -B "$smoke_root/staging:/staging" \
     -B "$smoke_root/agent:/logs/agent" \
     -B "$smoke_root/verifier:/logs/verifier" \

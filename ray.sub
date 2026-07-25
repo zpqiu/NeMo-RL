@@ -402,7 +402,11 @@ count=0
 while [[ \$count -lt $num_retries ]]; do
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
+    if ! bash "$SETUP_COMMAND_FILE"; then
+      echo "[ERROR] Setup command failed on the Ray head node." >&2
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
   fi
   bash /launch-head.sh
   count=\$((count+1))
@@ -509,7 +513,11 @@ count=0
 while [[ \$count -lt $num_retries ]]; do
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
+    if ! bash "$SETUP_COMMAND_FILE"; then
+      echo "[ERROR] Setup command failed on Ray worker $node_i." >&2
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
   fi
   bash /launch-worker.sh
   count=\$((count+1))

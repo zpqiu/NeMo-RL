@@ -14,7 +14,8 @@
 # limitations under the License.
 set -euo pipefail
 
-test "$(uname -m)" = "aarch64"
+: "${MATH_CODE_ARCH:?build_math_code_sif_local.sh must set MATH_CODE_ARCH}"
+test "$(uname -m)" = "$MATH_CODE_ARCH"
 command -v timeout
 python3 -c 'import fastapi, uvicorn, pydantic, numpy, scipy, pandas; from math_verify import grader; from math_verify.errors import TimeoutException; from math_verify.metric import math_metric; from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig; print("runtime smoke test ok")'
 touch /app/write-test

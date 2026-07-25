@@ -1,5 +1,6 @@
-# FP8-rollout A/B for the 30B-A3B MoE: identical operating point to the BF16
-# bring-up config; only vLLM generation switches to blockwise FP8. Unlike the
+# Final FP8-rollout recipe for the 30B-A3B MoE: identical operating point to
+# the BF16 bring-up config, except that vLLM generation uses blockwise FP8.
+# Unlike the
 # 8B dense case (KV-bound, FP8 topped out at parity), MoE decode at small
 # per-replica M is weight-traffic-bound — routed experts fan out across the
 # batch so per-iteration expert reads approach the full 61GB — which is the
@@ -32,6 +33,11 @@ policy:
         VLLM_USE_DEEP_GEMM_E8M0: "0"
       pow2_weight_scaling_factors: false
       pow2_activation_scaling_factors: false
+      # Keep the MoE router (model.layers.N.mlp.gate) in bf16. The official
+      # FP8 checkpoint excludes it, and quantizing router logits perturbs the
+      # discrete top-8 expert choice. This pattern does not match experts'
+      # gate_proj parameters; lm_head is not quantized by vLLM's Fp8Config.
+      quantization_ignored_layer_kws: ["mlp.gate"]
 
 logger:
   wandb:

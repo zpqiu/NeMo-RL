@@ -85,7 +85,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo-math-with-code-qwen3-30ba3b/checkpoints"
+  checkpoint_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b/checkpoints"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 1
@@ -325,7 +325,7 @@ env:
           harbor_validate_training_tokens: false
 
 logger:
-  log_dir: "results/grpo-math-with-code-qwen3-30ba3b/logs"
+  log_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b/logs"
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: false
