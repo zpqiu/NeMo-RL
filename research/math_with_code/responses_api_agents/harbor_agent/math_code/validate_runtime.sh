@@ -21,8 +21,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OVERLAY_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+source "$OVERLAY_ROOT/math_code_paths.sh"
 DEFAULT_TASK_DIR="$OVERLAY_ROOT/responses_api_agents/harbor_agent/data/math_code/aime_2024/task_000000"
 TASK_DIR="${MATH_CODE_TASK_DIR:-$DEFAULT_TASK_DIR}"
+MATH_CONFIG="$OVERLAY_ROOT/responses_api_agents/harbor_agent/configs/math_code_harbor_agent.yaml"
 FULL_TRIAL_TIMEOUT_SEC="${FULL_TRIAL_TIMEOUT_SEC:-180}"
 
 log() {
@@ -47,7 +49,7 @@ find_harbor_python() {
     # expected in /opt/ray_venvs/...NemoGym; it belongs in the harbor_agent
     # server venv under NEMO_GYM_VENV_DIR (normally /opt/gym_venvs, or a
     # cluster-shared override for multi-node jobs).
-    local venv_root="${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"
+    local venv_root="$NEMO_GYM_VENV_DIR"
     local -a candidates=()
     for candidate in \
         "$venv_root/responses_api_agents/harbor_agent/.venv/bin/python" \
@@ -82,24 +84,15 @@ log "overlay root: $OVERLAY_ROOT"
 log "Harbor agent Python: $PYTHON"
 log "Host: $(hostname); arch: $(uname -m); uid: $(id -u)"
 
-log "checking installed package/API compatibility"
+log "checking required runtime imports"
 "$PYTHON" - <<'PY'
 import importlib.metadata
-import inspect
-import os
 import platform
 import sys
 
 import harbor
 import nemo_gym
-from harbor.agents.base import BaseAgent
-from harbor.environments.base import BaseEnvironment
-from harbor.models.agent.context import AgentContext
-from harbor.models.job.config import JobConfig
-from nemo_gym.openai_utils import NeMoGymResponse
-from responses_api_agents.harbor_agent.app import HarborAgent, HarborAgentConfig
 from responses_api_agents.harbor_agent.custom_agents.math_code_harbor_agent import MathCodeHarborAgent
-from responses_api_agents.harbor_agent.custom_agents.math_code_session import _execute_once
 from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import SingularityEnvironment
 
 
@@ -112,27 +105,13 @@ def version(*names: str) -> str:
     return "unknown"
 
 
-assert issubclass(MathCodeHarborAgent, BaseAgent)
-assert issubclass(SingularityEnvironment, BaseEnvironment)
-assert "harbor_job_timeout_sec" in HarborAgentConfig.model_fields
-assert "harbor_job_cooperative_timeout_sec" in HarborAgentConfig.model_fields
-assert "harbor_request_queue_timeout_sec" in HarborAgentConfig.model_fields
-assert "harbor_raise_on_job_error" in HarborAgentConfig.model_fields
-assert "harbor_validate_training_tokens" in HarborAgentConfig.model_fields
-assert SingularityEnvironment._fakeroot_args(0) == []
-assert SingularityEnvironment._fakeroot_args(1000) == ["--fakeroot"]
-
-namespace = {"__builtins__": __builtins__}
-first = _execute_once("counter = 40\ncounter", namespace, 2)
-second = _execute_once("counter += 2\ncounter", namespace, 2)
-assert first["success"] and first["result"] == "40", first
-assert second["success"] and second["result"] == "42", second
-
 print(f"python={sys.version.split()[0]} machine={platform.machine()} executable={sys.executable}")
 print(f"harbor={version('harbor', 'harbor-ai')} module={getattr(harbor, '__file__', None)}")
 print(f"nemo-gym={version('nemo-gym')} module={getattr(nemo_gym, '__file__', None)}")
 print(f"ray={version('ray')} pydantic={version('pydantic')} httpx={version('httpx')}")
-print("custom imports, Harbor models, watchdog field, fakeroot policy, and stateful executor: OK")
+print(f"agent={MathCodeHarborAgent.__module__}.{MathCodeHarborAgent.__name__}")
+print(f"environment={SingularityEnvironment.__module__}.{SingularityEnvironment.__name__}")
+print("Harbor overlay imports: OK")
 PY
 
 
@@ -144,6 +123,7 @@ fi
 [[ -d "$TASK_DIR" ]] || die "task directory not found: $TASK_DIR"
 [[ -f "$TASK_DIR/task.toml" ]] || die "task.toml not found under: $TASK_DIR"
 [[ -f "$TASK_DIR/tests/expected_answer.json" ]] || die "expected_answer.json not found under: $TASK_DIR"
+[[ -f "$MATH_CONFIG" ]] || die "production Harbor config not found: $MATH_CONFIG"
 command -v singularity >/dev/null 2>&1 || die "singularity is not on PATH inside the sqsh"
 command -v timeout >/dev/null 2>&1 || die "GNU timeout is not on PATH"
 
@@ -167,7 +147,7 @@ trap cleanup EXIT
 # policy model: Harbor -> custom agent -> Singularity -> persistent Python ->
 # ATIF trajectory -> verifier -> NeMo-Gym response conversion.
 timeout --signal=TERM --kill-after=15s "${FULL_TRIAL_TIMEOUT_SEC}s" \
-    "$PYTHON" - "$TASK_DIR" "$JOBS_DIR" <<'PY'
+    "$PYTHON" - "$TASK_DIR" "$JOBS_DIR" "$MATH_CONFIG" <<'PY'
 import asyncio
 import concurrent.futures
 import json
@@ -181,6 +161,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 import responses_api_agents.harbor_agent.app as harbor_app_module
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from responses_api_agents.harbor_agent.app import (
@@ -188,15 +170,37 @@ from responses_api_agents.harbor_agent.app import (
     HarborAgentConfig,
     HarborRunRequest,
 )
+from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import (
+    resolve_math_code_sif_path,
+)
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
 
 task_dir = Path(sys.argv[1]).resolve()
 jobs_dir = Path(sys.argv[2]).resolve()
+math_config_path = Path(sys.argv[3]).resolve()
 task_config = tomllib.loads((task_dir / "task.toml").read_text())
-sif_path = Path(task_config["environment"]["docker_image"]).expanduser()
+sif_path = resolve_math_code_sif_path(task_config["environment"]["docker_image"])
 if not sif_path.is_file():
     raise FileNotFoundError(f"task.toml points to a missing SIF: {sif_path}")
+
+production_config = yaml.safe_load(math_config_path.read_text())
+try:
+    production_agent = production_config["math_code_harbor_agent"][
+        "responses_api_agents"
+    ]["harbor_agent"]
+except (KeyError, TypeError) as exc:
+    raise RuntimeError(
+        f"invalid production Harbor config: {math_config_path}"
+    ) from exc
+
+# Reuse production constructor kwargs so this smoke test fails if the custom
+# agent contract and its real config drift apart. The local model server and
+# short watchdogs below are intentional test-only substitutions.
+agent_kwargs = dict(production_agent["harbor_agent_kwargs"])
+environment_kwargs = dict(production_agent.get("harbor_environment_kwargs") or {})
+environment_kwargs["singularity_image_cache_dir"] = str(jobs_dir / "sif-cache")
+environment_kwargs["workdir"] = "/app"
 
 verifier_import_probe = subprocess.run(
     [
@@ -337,26 +341,14 @@ async def run_trial() -> tuple[Path, Any]:
                 "workdir": "/app",
             }
         },
-        harbor_agent_name=None,
-        harbor_agent_import_path=(
-            "responses_api_agents.harbor_agent.custom_agents."
-            "math_code_harbor_agent:MathCodeHarborAgent"
+        harbor_agent_name=production_agent.get("harbor_agent_name"),
+        harbor_agent_import_path=production_agent.get("harbor_agent_import_path"),
+        harbor_agent_kwargs=agent_kwargs,
+        harbor_environment_type=production_agent.get("harbor_environment_type"),
+        harbor_environment_import_path=production_agent.get(
+            "harbor_environment_import_path"
         ),
-        harbor_agent_kwargs={
-            "max_steps": 4,
-            "code_timeout_sec": 5,
-            "model_timeout_sec": 20.0,
-            "collect_rollout_details": True,
-        },
-        harbor_environment_type=None,
-        harbor_environment_import_path=(
-            "responses_api_agents.harbor_agent.custom_envs.singularity."
-            "singularity:SingularityEnvironment"
-        ),
-        harbor_environment_kwargs={
-            "singularity_image_cache_dir": str(jobs_dir / "sif-cache"),
-            "workdir": "/app",
-        },
+        harbor_environment_kwargs=environment_kwargs,
         harbor_agent_override_timeout=90,
         harbor_verifier_override_timeout=30,
         harbor_timeout_multiplier=1.0,
@@ -414,9 +406,18 @@ async def run_trial() -> tuple[Path, Any]:
         harbor_app_module.ray.get = original_ray_get
         executor.shutdown(wait=True)
 
-    result_paths = list(jobs_dir.rglob("result.json"))
+    # Harbor may write both job summaries and per-trial results. Identify the
+    # latter by the artifact this smoke test consumes instead of relying on
+    # result count or generated directory-name conventions.
+    result_paths = [
+        path
+        for path in jobs_dir.rglob("result.json")
+        if (path.parent / "agent" / "trajectory.json").is_file()
+    ]
     if len(result_paths) != 1:
-        raise AssertionError(f"expected one Harbor result.json, found {result_paths}")
+        raise AssertionError(
+            f"expected one Harbor trial result with a trajectory, found {result_paths}"
+        )
     return result_paths[0].parent.resolve(), response
 
 

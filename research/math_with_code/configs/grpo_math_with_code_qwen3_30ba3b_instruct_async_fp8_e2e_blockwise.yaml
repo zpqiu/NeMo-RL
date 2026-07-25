@@ -1,10 +1,10 @@
-# FP8 end-to-end arm: v4's FP8 rollout flipped to pow2 scales + Megatron
+# FP8 end-to-end arm: the final FP8 rollout recipe, with pow2 scales + Megatron
 # training in FP8 (linear-layer GEMMs only, blockwise recipe, hybrid format).
 # Goal: the full chain — trainer GEMMs, refit weight cast, and rollout
 # activation quant — shares one quantization geometry: 128-block, power-of-2
 # scales.
 #
-# Two deliberate deltas vs the v4 control (NOT a single-variable A/B):
+# Two deliberate deltas vs the FP8 rollout control (NOT a single-variable A/B):
 #   1. policy.megatron_cfg.fp8_cfg: trainer linear GEMMs go FP8 blockwise.
 #   2. rollout pow2_*_scaling_factors: true — aligns the rollout quant grid
 #      with the trainer's (on GB200 the trainer CANNOT do non-pow2: blockwise
@@ -15,7 +15,7 @@
 # Training-side quantization surface: TE Linear/GroupedLinear GEMMs only.
 # Attention (fp8_dpa off), embeddings, lm_head, and the MoE router
 # (moe_router_dtype: fp32 in the base yaml) all stay high precision — the
-# v4 rollout lesson (router must not be quantized) holds by construction.
+# rollout recipe likewise excludes the router from vLLM FP8 conversion.
 #
 # Recipe notes:
 # - fp8: "hybrid" (fwd act/weight e4m3, bwd grads e5m2) — the verified-stable
@@ -26,7 +26,7 @@
 #   exemplars that set it ran on Hopper).
 # - fp8_param: false — master weights stay bf16 (known NaN
 #   token_mult_prob_error with fp8_param: true, NeMo-RL issue #1164); refit
-#   re-quantizes from bf16 exactly as in v4 (now onto the pow2 grid).
+#   re-quantizes from bf16 exactly as in the rollout control (now onto the pow2 grid).
 # - Rollout pow2 mechanics: weights via cast_tensor_to_fp8_blockwise's pow2
 #   branch (E8M0-biased exponents, battle-tested on the 8B pow2 runs);
 #   activations via forcing use_ue8m0=True in vLLM 0.20's own
@@ -38,9 +38,9 @@
 #   model either way).
 # - Sequence-packing pad divisor auto-switches to 128 for blockwise
 #   (nemo_rl/models/megatron/data.py); no config change needed.
-# - use_precision_aware_optimizer stays true (base yaml), matching the v4
+# - use_precision_aware_optimizer stays true (base yaml), matching the rollout
 #   control. Flip to false only if NaNs implicate optimizer-state dtype.
-defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async_fp8_v4.yaml
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async_fp8.yaml
 
 policy:
   megatron_cfg:

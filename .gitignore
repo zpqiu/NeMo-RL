@@ -52,6 +52,10 @@ code_snapshots*/
 /reports/
 /session/
 
+# Runtime overlay used by research/math_with_code; recreate from its README.
+/responses_api_agents
+/research/math_with_code/.artifacts/
+
 # EAGLE-3 track: local-only until the online-drafter phase is ready to publish
 /research/math_with_code/eagle3/
 /research/math_with_code/configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_eagle3_offline.yaml

@@ -629,7 +629,11 @@ while [[ \$count -lt $num_retries ]]; do
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
+    if ! bash "$SETUP_COMMAND_FILE"; then
+      echo "[ERROR] Setup command failed on the Ray head node." >&2
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
   fi
   if cat <<EOFINNER | bash; then
 ray start --head \
@@ -835,7 +839,11 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
+    if ! bash "$SETUP_COMMAND_FILE"; then
+      echo "[ERROR] Setup command failed on Ray worker \$SLURM_PROCID." >&2
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
   fi
   echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash

@@ -31,10 +31,10 @@ async GRPO, ~220 steps). Validation is AIME 2025, 30 tasks x 16 rollouts each:
 | After training (best, step 220) | **85.8** |
 
 The gain is not just score: the model *learns the tool*. At step 0 rollouts
-barely touch Python (~0.2 calls each); training grows steady tool use to ~7
+barely touch Python (\~0.2 calls each); training grows steady tool use to \~7
 calls per rollout, then goes through a phase transition around step 130 into a
-heavy tool-iteration regime (~14 calls, 15+ turns, responses growing from
-~6.5k to ~11k tokens) — and the late accuracy gains ride on that transition.
+heavy tool-iteration regime (\~14 calls, 15+ turns, responses growing from
+\~6.5k to \~11k tokens) — and the late accuracy gains ride on that transition.
 
 ![BF16 results](reports/fp8_rollout_30b/figures/results_bf16.svg)
 
@@ -46,50 +46,110 @@ and the router-precision ablation).
 
 ## Bring-up
 
-This assumes you have already run a single-turn GRPO job with NeMo-RL on your
-cluster — container, `sbatch + ray.sub` submission, `uv` — per
-[docs/cluster.md](../../docs/cluster.md) and
-[docs/guides/grpo.md](../../docs/guides/grpo.md). Only the math-code deltas
-are listed here.
-
-**Prerequisites on top of stock single-turn GRPO:**
-
-- A recent NeMo-RL image (nightly or >= 0.7): the recipe additionally needs
-  `singularity`/`apptainer` and the prebuilt NemoGym venv inside the training
-  container.
-- The Gym submodule checked out: `git submodule update --init
-  3rdparty/Gym-workspace/Gym` (the Harbor venv editable-installs it).
-- `/dev/fuse:/dev/fuse` in the container mounts of **every** job below,
-  including training. Harbor trials run `singularity exec` inside the
-  training container and squashfuse needs the device; missing it fails with
-  `squashfuse_ll exited: fuse: device not found`.
-- Hugging Face network access for steps 2–3.
-
-All three one-time steps run inside the training container **on the
-compute-node architecture** (x86 login nodes won't do for aarch64 clusters:
-the venv is arch-specific and the SIF pull needs apptainer) — e.g. via
-`srun --container-image=<training image> --container-mounts=...,/dev/fuse:/dev/fuse`.
-Outputs all land on shared storage.
+This assumes a working single-turn NeMo-RL GRPO launch on the target cluster;
+use its standard container and `sbatch + ray.sub` flow. Math-with-code adds a
+per-trial SIF, a shared Harbor venv, and `/dev/fuse:/dev/fuse` in every
+container mount. Check out all submodules first:
 
 ```bash
-# 1. Pull the per-trial SIF (x86 clusters: build via docker/ instead).
-apptainer pull oras://ghcr.io/zpqiu/math-code-sif:py312-aarch64
-
-# 2. Build the Harbor venv (NEMO_GYM_VENV_DIR on shared storage).
-NEMO_GYM_VENV_DIR=/shared/gym_venvs \
-    responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh
-
-# 3. Build all three datasets (non8 train + AIME 2024/2025 val).
-MATH_CODE_SIF_PATH=$PWD/math-code-sif_py312-aarch64.sif \
-    responses_api_agents/harbor_agent/math_code/build_datasets.sh
-
-# Optional: end-to-end sanity check — one real Harbor trial against a fake
-# Responses API, no GPUs or policy model needed.
-NEMO_GYM_VENV_DIR=/shared/gym_venvs \
-    responses_api_agents/harbor_agent/math_code/validate_runtime.sh
+git submodule update --init --recursive
 ```
 
-**Launch** is the standard `sbatch + ray.sub` flow from
+Run the one-time setup inside the training container on a compute node of the
+target architecture. Run from a repo checkout on storage shared by every
+training node. Select the architecture once; no absolute artifact paths are
+required:
+
+```bash
+cd <repo-root>
+MATH_CODE_ARCH=x86_64  # use aarch64 on Grace/GB200
+source research/math_with_code/math_code_paths.sh
+```
+
+The default layout keeps the complete bring-up under this project:
+
+- SIF and Harbor venv:
+  `research/math_with_code/.artifacts/<architecture>/`
+- generated task trees and request JSONL:
+  `research/math_with_code/responses_api_agents/harbor_agent/data/math_code/`
+- checkpoints and training logs:
+  `research/math_with_code/.artifacts/runs/`
+
+These paths are gitignored. NeMo-RL's standard `MOUNTS="$PWD:$PWD"` mounts the
+whole checkout at the same location in every container, so none of them needs
+an additional mount. The generated task TOMLs store a project-relative SIF
+reference, which the custom Singularity environment resolves independently of
+its process working directory.
+
+Set `MATH_CODE_ARTIFACT_ROOT` only if the repo is not on storage shared by all
+training nodes. The helper intentionally ignores the training image's
+container-local `NEMO_GYM_VENV_DIR=/opt/gym_venvs` default.
+
+### Step 1 — pull the matching prebuilt SIF
+
+This requires `apptainer`. If it is not installed on the host, run this step
+inside the NeMo-RL training image on a compute node; the training image
+includes Apptainer. Use the cluster's usual containerized `srun`/`sbatch`
+entry point rather than installing Apptainer on the login node.
+
+```bash
+mkdir -p "$MATH_CODE_ARTIFACT_ROOT"
+if [[ -r "$MATH_CODE_SIF_PATH" ]]; then
+    echo "Reusing existing SIF: $MATH_CODE_SIF_PATH"
+else
+    apptainer pull "$MATH_CODE_SIF_PATH" \
+        "oras://ghcr.io/zpqiu/math-code-sif:py312-$MATH_CODE_ARCH"
+fi
+```
+
+Use `apptainer pull --force` only when intentionally refreshing an existing
+image.
+
+### Step 2 — build the shared Harbor venv
+
+```bash
+research/math_with_code/responses_api_agents/harbor_agent/math_code/build_harbor_venv.sh
+```
+
+### Step 3 — materialize the datasets
+
+This downloads the train source and builds the non8 train set plus AIME 2024
+and 2025 validation task trees. It requires Hugging Face access on the first
+run. To avoid anonymous Hub rate limits, set `HF_TOKEN` through the cluster's
+usual secret mechanism. Optionally set `HF_HOME` to the user's preferred
+shared cache location and include that location in the training container
+mounts.
+
+```bash
+research/math_with_code/responses_api_agents/harbor_agent/math_code/build_datasets.sh
+```
+
+### Step 4 — validate the complete runtime
+
+This runs one deterministic Harbor task against a local fake Responses API. It
+does not start a policy model or use GPUs, but exercises the real SIF,
+persistent Python session, verifier, and NeMo-Gym response conversion.
+
+```bash
+research/math_with_code/responses_api_agents/harbor_agent/math_code/validate_runtime.sh
+```
+
+The following is an equivalent shortcut for steps 2–4. It first builds or
+validates the Harbor venv, then materializes or reuses datasets whose task
+TOMLs point at the selected project-local SIF, and finally runs the same real
+runtime smoke test:
+
+```bash
+research/math_with_code/responses_api_agents/harbor_agent/math_code/bringup_math_with_code.sh
+```
+
+It reuses a healthy venv and datasets whose task TOMLs already reference the
+requested SIF. Set `MATH_CODE_VENV_FORCE_REBUILD=1` or
+`MATH_CODE_FORCE_REBUILD=1` only after changing the corresponding inputs.
+
+### Step 5 — train
+
+Launch is the standard `sbatch + ray.sub` flow from
 [docs/cluster.md](../../docs/cluster.md) with two math-code additions: a
 repo-root symlink that lets the overlay fork win nemo-gym's cwd-first server
 discovery (see "How the overlay fork works"), and a per-node preflight in
@@ -97,22 +157,37 @@ discovery (see "How the overlay fork works"), and a per-node preflight in
 
 ```bash
 cd <repo-root>
+MATH_CODE_ARCH=x86_64
+source research/math_with_code/math_code_paths.sh
 ln -sfn research/math_with_code/responses_api_agents responses_api_agents
 
-SETUP_COMMAND="export NEMO_GYM_VENV_DIR=/shared/gym_venvs && \
+SETUP_COMMAND="export MATH_CODE_ARCH=$MATH_CODE_ARCH && \
+    source research/math_with_code/math_code_paths.sh && \
     ./research/math_with_code/responses_api_agents/harbor_agent/math_code/preflight_math_with_code_node.sh" \
-COMMAND="export NEMO_GYM_VENV_DIR=/shared/gym_venvs && \
+COMMAND="export MATH_CODE_ARCH=$MATH_CODE_ARCH && \
+    source research/math_with_code/math_code_paths.sh && \
     uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
-    --config research/math_with_code/configs/grpo_math_with_code_qwen3_8b_thinking_async.yaml" \
+    --config research/math_with_code/configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_h100.yaml" \
 CONTAINER=<training image> \
-MOUNTS="<your mounts>,/dev/fuse:/dev/fuse" \
-GPUS_PER_NODE=4 \
-    sbatch --nodes=3 --account=... --job-name=... ray.sub
+MOUNTS="$PWD:$PWD,/dev/fuse:/dev/fuse" \
+GPUS_PER_NODE=8 \
+    sbatch --nodes=2 --account=... --partition=batch --gres=gpu:8 \
+    --job-name=math-code-30b-bf16-h100 ray.sub
 ```
 
-The 8B config wants 3 nodes x 4 GPUs (2 generation + 1 training, see the
-yaml's cluster block); the 30B config wants 4 nodes. `WANDB_API_KEY` in the
-environment enables W&B logging as usual.
+The H100 config uses one TP2 vLLM generation node and one TP4/EP8 Megatron
+training node. It disables W&B for bring-up; enable it explicitly for tracked
+runs. The GB200 BF16 and final FP8 rollout recipes are the corresponding 30B
+configs without the `_h100` suffix.
+
+### Custom SIFs
+
+For a customized image, edit the matching `docker/math_code_<arch>.def` and
+run `docker/build_math_code_sif_local.sh` inside a compatible compute-node
+training container. By default it publishes to the same repo-local artifact
+path; set `SIF_OUT` only to override that location. The script is
+scheduler-neutral and performs both image and isolated-runtime smoke tests.
+Rerun steps 3–4 (or the shortcut above) afterwards.
 
 ## Data
 
@@ -144,16 +219,16 @@ Datasets come from two places:
   filter cost a full difficulty-labeling campaign (8 rollouts x 17398 prompts).
 - **Everything else rebuilds from one script.** `build_datasets.sh` (under
   `responses_api_agents/harbor_agent/math_code/`) builds the full supported
-  set — non8 train + AIME 2024/2025 val — in one pass:
+  set — non8 train + AIME 2024/2025 val — in one pass. From the repo root:
 
 ```bash
-MATH_CODE_SIF_PATH=/shared/path/to/math-code.sif \
-    responses_api_agents/harbor_agent/math_code/build_datasets.sh
+source research/math_with_code/math_code_paths.sh
+research/math_with_code/responses_api_agents/harbor_agent/math_code/build_datasets.sh
 ```
 
-That is the only input; sources, aliases, task counts, and reward shaping are
-fixed inside the script. It converts the non8 subset (task ids renumbered
-`task_000000..task_006388`, tree/JSONL pair self-consistent),
+The default SIF reference, sources, aliases, task counts, and reward shaping
+are fixed by the project helpers. The script converts the non8 subset (task
+ids renumbered `task_000000..task_006388`, tree/JSONL pair self-consistent),
 [tongyx361/AIME-2024-Boxed](https://huggingface.co/datasets/tongyx361/AIME-2024-Boxed),
 and [math-ai/aime25](https://huggingface.co/datasets/math-ai/aime25) (plain
 problem/answer rows, adapted via `convert_plain_problem_answer.py` so prompts
@@ -205,9 +280,8 @@ mechanisms:
    its install location (`nemo_gym/cli.py`). The repo-root symlink
    `responses_api_agents -> research/math_with_code/responses_api_agents`
    (created in the Bring-up launch step) makes the fork win; `config_paths`
-   resolution works the same way. The symlink is a runtime artifact — keep it
-   out of git (e.g. via `.git/info/exclude`) and recreate it with the same
-   `ln -sfn` on a fresh clone.
+   resolution works the same way. The root `.gitignore` excludes this runtime
+   symlink; recreate it with the same `ln -sfn` on a fresh clone.
 2. **Python imports** — the editable nemo-gym install maps
    `responses_api_agents.*` to the pristine submodule via a setuptools
    meta-path finder. PathFinder consults `sys.path` first, so the fork's

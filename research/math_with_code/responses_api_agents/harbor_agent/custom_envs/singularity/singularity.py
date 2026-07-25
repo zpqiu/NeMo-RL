@@ -36,6 +36,44 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
+def _find_math_code_project_root() -> Path:
+    """Find the project root without assuming how this module was imported."""
+    configured_root = os.environ.get("MATH_CODE_PROJECT_ROOT")
+    if configured_root:
+        return Path(os.path.abspath(os.path.expanduser(configured_root)))
+
+    module_path = Path(os.path.abspath(__file__))
+    for candidate in module_path.parents:
+        if (candidate / "math_code_paths.sh").is_file():
+            return candidate
+
+    # The repo-root responses_api_agents symlink may hide the research path in
+    # __file__. Follow that symlink only as a fallback; normal launches source
+    # math_code_paths.sh and preserve the user's mounted checkout alias above.
+    real_module_path = Path(os.path.realpath(__file__))
+    for candidate in real_module_path.parents:
+        if (candidate / "math_code_paths.sh").is_file():
+            return candidate
+
+    raise RuntimeError(
+        "cannot locate research/math_with_code; source math_code_paths.sh "
+        "before starting the Harbor server"
+    )
+
+
+MATH_CODE_PROJECT_ROOT = _find_math_code_project_root()
+
+
+def resolve_math_code_sif_path(image: str) -> Path:
+    """Resolve task SIF references against the math-with-code project root."""
+    sif_path = Path(image).expanduser()
+    if not sif_path.is_absolute():
+        sif_path = MATH_CODE_PROJECT_ROOT / sif_path
+    # Normalize "." and ".." without resolving shared-filesystem aliases. The
+    # repo is bind-mounted at the user's checkout path, which may intentionally
+    # differ from the host filesystem's physical path.
+    return Path(os.path.abspath(sif_path))
+
 
 class MemoryLimitExceededError(Exception):
     """Raised when a container exceeds its memory limit."""
@@ -57,6 +95,9 @@ class SingularityEnvironment(BaseEnvironment):
         singularity_no_mount: Comma-separated mount types to suppress
             (default "home,tmp,bind-paths"). Use "" to allow all Singularity mounts.
         workdir: Container working directory override.
+
+    Relative .sif references in task.toml are resolved against the
+    research/math_with_code project root, never the caller's cwd.
     """
 
     def __init__(
@@ -139,7 +180,7 @@ class SingularityEnvironment(BaseEnvironment):
             )
 
         if self._is_sif_image:
-            sif_path = Path(self.task_env_config.docker_image)
+            sif_path = resolve_math_code_sif_path(self.task_env_config.docker_image)
             if not sif_path.exists():
                 raise FileNotFoundError(
                     f".sif file not found: {sif_path}. Please convert Docker images to .sif format first."
@@ -683,7 +724,7 @@ class SingularityEnvironment(BaseEnvironment):
     async def start(self, force_build: bool) -> None:
         """Start the Singularity environment."""
         if self._is_sif_image:
-            self._sif_path = Path(self.task_env_config.docker_image)
+            self._sif_path = resolve_math_code_sif_path(self.task_env_config.docker_image)
         else:
             self._sif_path = await self._convert_docker_to_sif(self.task_env_config.docker_image)
 

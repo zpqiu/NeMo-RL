@@ -1,0 +1,46 @@
+# H100 bring-up override for the BF16 math-with-code reference.
+# Two 8-GPU nodes: one generation node (vLLM TP2 x 4 replicas) and one
+# Megatron training node (TP4 x EP8, CP2). The base config targets four
+# 4-GPU GB200 nodes with vLLM TP1 x 8 replicas instead.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+policy:
+  # With CP2 + TP4 + sequence parallel, packed sequences must align to
+  # CP * 2 * TP = 16. The GB200 base uses CP1 and derives 4 from TP alone.
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    context_parallel_size: 2
+  generation:
+    vllm_cfg:
+      # A 30B BF16 checkpoint does not leave usable KV-cache headroom at TP1
+      # on an 80GB H100; TP2 leaves roughly half a GPU for cache and runtime.
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.70
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+env:
+  nemo_gym:
+    math_code_harbor_agent:
+      responses_api_agents:
+        harbor_agent:
+          # Four TP2 engines provide less in-flight cache than the eight TP1
+          # GB200 engines. Keep the queue bounded for reliable first bring-up.
+          concurrency: 128
+
+checkpointing:
+  checkpoint_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-h100/checkpoints"
+
+logger:
+  log_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-h100/logs"
+  # W&B is optional for a first-cluster bring-up. The base recipe enables it,
+  # which otherwise makes an unset WANDB_API_KEY fail before model startup.
+  wandb_enabled: false
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-async-h100"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

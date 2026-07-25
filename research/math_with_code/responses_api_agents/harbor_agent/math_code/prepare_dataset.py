@@ -244,7 +244,17 @@ def main() -> None:
         default=[],
         help="Local parquet shard downloaded with `hf download`; may be repeated.",
     )
-    parser.add_argument("--sif-path", type=Path, required=True)
+    parser.add_argument(
+        "--sif-path",
+        type=Path,
+        required=True,
+        help="Existing SIF used to validate the dataset environment.",
+    )
+    parser.add_argument(
+        "--sif-reference",
+        type=Path,
+        help="Value written to task.toml; defaults to the resolved --sif-path.",
+    )
     parser.add_argument("--tasks-dir", type=Path, required=True)
     parser.add_argument("--jsonl-path", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -262,6 +272,7 @@ def main() -> None:
     sif_path = args.sif_path.expanduser().resolve()
     if not sif_path.is_file():
         raise FileNotFoundError(f"SIF not found: {sif_path}")
+    sif_reference = args.sif_reference or sif_path
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be positive")
     if args.dataset_server_json and args.parquet_path:
@@ -300,7 +311,7 @@ def main() -> None:
         dataset_name=args.dataset,
         dataset_alias=args.dataset_alias,
         split=args.split,
-        sif_path=sif_path,
+        sif_path=sif_reference,
         tasks_dir=tasks_dir,
         jsonl_path=jsonl_path,
         seed=args.seed,
