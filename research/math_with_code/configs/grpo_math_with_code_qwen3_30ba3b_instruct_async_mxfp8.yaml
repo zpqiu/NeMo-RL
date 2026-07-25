@@ -37,6 +37,17 @@ policy:
         - "k_proj"
         - "v_proj"
         - "o_proj"
+    vllm_kwargs:
+      kernel_config:
+        # Override the base config's moe_backend=triton. vLLM 0.20 rejects that
+        # combination outright ("moe_backend='triton' is not supported for MXFP8
+        # MoE. Expected one of ['flashinfer_trtllm', 'marlin']", job 2444403),
+        # and flashinfer_trtllm is the layout
+        # process_weights_after_loading_mxfp8_moe already shuffles into. The
+        # triton pin exists to keep FusedMoE weights in checkpoint layout for
+        # refit; MXFP8 does not need it because it keeps checkpoint-layout
+        # scales in separate `*_weight_scale_from_checkpoint` parameters.
+        moe_backend: "flashinfer_trtllm"
 
 checkpointing:
   # Separate tree from the BF16 arm: the two arms are launched concurrently and
