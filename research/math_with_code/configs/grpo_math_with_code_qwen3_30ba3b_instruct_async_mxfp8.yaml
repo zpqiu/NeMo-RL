@@ -1,0 +1,49 @@
+# MXFP8-rollout arm for the 30B-A3B MoE: identical operating point to the BF16
+# bring-up config, except vLLM generation runs ModelOpt MXFP8 (E4M3 values with
+# E8M0 per-block shared exponents) instead of bf16.
+#
+# Quantization scope is MoE experts / MLP only:
+#   - attention projections (q/k/v/o) stay bf16, matching the validated
+#     upstream mxfp8-rollout templates under examples/configs/recipes/llm/
+#     performance/;
+#   - the MoE router (`model.layers.N.mlp.gate`) also stays bf16. The
+#     router-precision ablation in reports/fp8_rollout_30b found that
+#     quantizing router logits perturbs the discrete top-8 expert choice and
+#     suppresses this task's tool-use phase transition, so the router is held
+#     out of every quantized arm of this recipe.
+#
+# Refit: unlike the blockwise FP8 arm — which pins moe_backend=triton to keep
+# FusedMoE weights in checkpoint layout — MXFP8 carries its own refit-safe
+# path. NeMo-RL patches ModelOptMxFp8FusedMoE to register
+# `*_weight_scale_from_checkpoint` parameters in checkpoint layout for the
+# refit weight loaders to write into, and re-shuffles them into the FlashInfer
+# TRTLLM layout on every reload.
+defaults: grpo_math_with_code_qwen3_30ba3b_instruct_async.yaml
+
+loss_fn:
+  # Same guard as the blockwise FP8 arm: NeMo-RL requires importance-sampling
+  # correction when vLLM generation is quantized. Affects training only, so the
+  # validation accuracy readout stays a pure correctness metric.
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      is_mx: true
+      quantization_ignored_layer_kws:
+        - "mlp.gate"
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+
+checkpointing:
+  # Separate tree from the BF16 arm: the two arms are launched concurrently and
+  # would otherwise write into the same checkpoint directory.
+  checkpoint_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-mxfp8/checkpoints"
+
+logger:
+  log_dir: "research/math_with_code/.artifacts/runs/qwen3-30ba3b-mxfp8/logs"
+  wandb:
+    name: "qwen3-30ba3b-instruct-mathcode-async-mxfp8"
