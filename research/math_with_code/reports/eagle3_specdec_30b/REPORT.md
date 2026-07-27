@@ -126,6 +126,35 @@ this feature on a MoE policy, since it forfeits permute fusion.
 
 ## Caveats
 
+- **The arms' policies diverge behaviorally, which confounds the attribution.**
+  Step-aligned against the BF16 reference chain, `turns_per_sample/mean` runs
+  1.26 / ~2.0 / ~4 / ~6.4 in all arms through step 80, after which the frozen
+  arm stalls near 8 while the online arm reaches ~11 and BF16 reaches ~12.9.
+  The frozen arm's acceptance decline is therefore not purely drafter
+  staleness: its policy also settled into a shorter, less tool-heavy regime,
+  and rollouts from a different behavioral regime are not equally predictable.
+  Two things bound how much this matters. First, the online arm is *within*
+  the run-to-run band — it exceeds BF16 at steps 100-140 (9.36 vs 7.57) and
+  trails at 160 (11.07 vs 12.85), while FP8-v4 swings further against the same
+  reference (9.56 vs 12.85 at 160, then 15.01 vs 13.67 at 200); this workload's
+  heavy-tool transition is known to fire at high variance. Second, the
+  divergence is not a speculative-decoding sampling artifact — see below.
+  Disentangling the two contributions requires evaluating both drafters
+  against a *common* policy checkpoint, which is not done here.
+- **Speculation is not biasing the rollout distribution.** `gen_kl_error`, the
+  rollout-vs-training logprob mismatch, is 0.0015-0.0016 in both eagle arms and
+  in the BF16 reference, flat across all 160 steps; `sampling_importance_ratio`
+  and `probs_ratio` are 1.0000 everywhere. This is the metric that would move
+  first if rejection sampling or the returned logprobs were skewed, and it is
+  the check the FP8 study used for the same purpose. Mechanistically this is
+  also the expected direction: a worse drafter yields more rejections and
+  therefore *more* tokens drawn directly from the target model.
+- Both eagle arms sit ~12% below the BF16 reference in `approx_entropy`
+  (0.287-0.307 vs 0.325-0.359) from step 40 onward — early enough that drafter
+  staleness cannot explain it, and common to both arms, so it points at what
+  they share against the reference (sequence packing disabled) or at these two
+  runs' seeds. Lower entropy is consistent with the weaker/later tool-use
+  transition.
 - Single seed per arm. The paired design controls common-mode noise but not
   seed-level differences in the policy trajectory.
 - Consecutive steps are autocorrelated, so the nominal p-values overstate
