@@ -3,7 +3,7 @@
 > **Status**: companion to `fp8_rollout_30b/REPORT.md`. Same model, harness,
 > cluster and operating point, so the two rollout-acceleration levers (FP8
 > weight quantization and speculative decoding) are directly comparable. Data
-> through 40 matched training steps; the arms were still running at cutoff.
+> through 200 matched training steps (the frozen arm ran to 221).
 
 ## Settings
 
