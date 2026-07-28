@@ -58,7 +58,8 @@ RESULTS_PANELS = [
     ("train/turns_per_sample/mean", "turns / sample", "Tool-use depth", 9),
 ]
 PERF_PANELS = [
-    ("time_per_output_token_ms", "ms / token", "Time per output token", 9),
+    ("decode_ms_per_token", "ms / token", "Decode time per output token", 9),
+    ("time_per_output_token_ms", "ms / token", "HTTP wall per output token", 9),
     ("gen_kl_error_x1000", "KL x1000", "Mismatch KL (rollout vs training)", 9),
 ]
 
@@ -135,6 +136,18 @@ def main() -> None:
         # queue + prefill + decode — with tool execution excluded, so it
         # measures per-request serving speed at matched load.
         df["time_per_output_token_ms"] = 1000.0 * df[GEN_SEC] / df[GEN_TOKENS]
+        # Decode-only cost per generated token: vLLM's per-request decode time
+        # over tokens per request. The HTTP wall above accumulates queue, per-turn
+        # round trips and prefill across every turn of a rollout, so it rises with
+        # tool-use depth even when decode speed is flat — the frozen arm's jump to
+        # ~14 ms/token after its step-195 transition is entirely that, its decode
+        # cost is unchanged. The per-request metrics landed partway through the
+        # BF16 chain, so that arm only carries this series from step 227 on.
+        if "train/vllm/request_decode_time_mean_s" in df.columns:
+            tokens_per_call = (df[GEN_TOKENS]
+                               / df["train/math_code_harbor_agent/num_model_calls/mean"])
+            df["decode_ms_per_token"] = (
+                1000.0 * df["train/vllm/request_decode_time_mean_s"] / tokens_per_call)
         # Mismatch KL is ~1.5e-3 in every arm; plot it scaled so the panel is
         # readable rather than a flat line at the axis floor.
         df["gen_kl_error_x1000"] = 1000.0 * df["train/gen_kl_error"]
@@ -150,19 +163,23 @@ def main() -> None:
 
     render(frames, (ONLINE, FROZEN, BF16), RESULTS_PANELS, 3,
            "results_dynamics.svg", (12.8, 6.4))
-    render(frames, (ONLINE, FROZEN, BF16), PERF_PANELS, 2,
-           "rollout_perf.svg", (11.0, 3.8))
+    render(frames, (ONLINE, FROZEN, BF16), PERF_PANELS, 3,
+           "rollout_perf.svg", (14.0, 3.9))
 
     # Windowed medians for the report text (matched-load comparisons).
-    print("\n| window | trained ms/token | frozen ms/token | BF16 ms/token |")
-    print("|---|---|---|---|")
-    for name, lo, hi in [("steps 10-60", 10, 60), ("steps 150-200", 150, 200)]:
-        cells = []
-        for alias, _, _, _ in (ONLINE, FROZEN, BF16):
-            win = frames[alias]
-            win = win[(win["step"] >= lo) & (win["step"] <= hi)]
-            cells.append(win["time_per_output_token_ms"].median())
-        print(f"| {name} | {cells[0]:.1f} | {cells[1]:.1f} | {cells[2]:.1f} |")
+    print("\n| window | metric | trained | frozen | BF16 |")
+    print("|---|---|---|---|---|")
+    for name, lo, hi in [("steps 10-60", 10, 60), ("steps 150-190", 150, 190),
+                         ("steps 200-221", 200, 221)]:
+        for col, label in (("decode_ms_per_token", "decode ms/token"),
+                           ("time_per_output_token_ms", "HTTP ms/token")):
+            cells = []
+            for alias, _, _, _ in (ONLINE, FROZEN, BF16):
+                win = frames[alias]
+                win = win[(win["step"] >= lo) & (win["step"] <= hi)]
+                val = win[col].median() if col in win.columns else float("nan")
+                cells.append(f"{val:.2f}" if val == val else "-")
+            print(f"| {name} | {label} | {cells[0]} | {cells[1]} | {cells[2]} |")
 
     last = paired.tail(10)
     print(f"\nfinal 10 matched steps: trained {last[f'{ACC}_on'].mean():.3f} vs "

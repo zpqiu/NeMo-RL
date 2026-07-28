@@ -60,6 +60,15 @@ METRICS = [
     # prefill + decode — with tool execution excluded).
     "train/math_code_harbor_agent/generated_tokens/mean",
     "train/math_code_harbor_agent/model_generation_sec/mean",
+    "train/math_code_harbor_agent/num_model_calls/mean",
+    # vLLM's own per-request split. The HTTP wall above accumulates per rollout
+    # across every turn, so it inflates with tool-use depth even when decode
+    # speed is unchanged; only the decode component is what speculation
+    # accelerates. Added in a later commit than the BF16 reference chain, which
+    # is why that chain has no decode series.
+    "train/vllm/request_decode_time_mean_s",
+    "train/vllm/request_prefill_time_mean_s",
+    "train/vllm/request_queue_time_mean_s",
     "train/mean_gen_tokens_per_sample",
     "validation/timing/rollout/total",
     "timing/train/total_step_time",

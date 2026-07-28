@@ -111,27 +111,45 @@ while frozen is -4.4% under it.
 
 ![rollout performance](figures/rollout_perf.svg)
 
-Measured the same way as the FP8 study: *time per output token* = mean
-model-call wall seconds / mean generated tokens per call (batch sum/sum
-identity), where the wall clock is the HTTP call — vLLM queue + prefill +
-decode — with tool execution excluded.
+The FP8 study's rollout-speed metric is *time per output token* = mean
+model-call wall seconds / mean generated tokens (batch sum/sum identity), the
+wall clock being the HTTP call with tool execution excluded. **That metric does
+not survive the move to deep multi-turn rollouts**, and this campaign shows why:
+the harness accumulates it per rollout across every turn, so it charges each
+token with a share of the per-turn round trips and re-prefill, neither of which
+speculation accelerates. As tool-use depth grows the metric inflates on its own.
 
-| window | drafter trained | drafter frozen | BF16, no speculation |
-|---|---|---|---|
-| steps 10-60 | 6.7 ms/token | 7.1 | 12.9 |
-| steps 150-200 | 8.4 ms/token | 9.0 | 16.0 |
+The frozen arm makes the failure unmistakable. Across its step-195 transition
+its HTTP wall jumps 9.0 → 14.1 ms/token, nearly reaching the no-speculation
+reference, while its acceptance length is unchanged at ~1.99 — it had not lost
+any speculative benefit. Splitting out vLLM's own per-request decode time shows
+the decode cost essentially flat across that transition (8.81 → 8.41).
 
-**Speculation roughly halves time per output token** against the
-no-speculation reference, and the ratio holds as training progresses (1.9x
-early, 1.9x late) — consistent with the +82% per-stream throughput measured in
-the offline-drafter window. Against that, the trained-vs-frozen difference is
-second-order (6.7 vs 7.1, 8.4 vs 9.0): drafter training buys ~6% on top of the
-~2x that speculation itself buys.
+| window | metric | trained | frozen | BF16 |
+|---|---|---|---|---|
+| steps 10-60 | decode ms/token | 6.65 | 6.80 | — |
+| | HTTP ms/token | 6.69 | 7.08 | 12.90 |
+| steps 150-190 | decode ms/token | 7.46 | 8.81 | — |
+| | HTTP ms/token | 8.47 | 8.98 | 15.97 |
+| steps 200-221 | decode ms/token | 7.04 | 8.41 | — |
+| | HTTP ms/token | 7.90 | 14.10 | 16.52 |
+| steps 227-243 | decode ms/token | — | — | 15.01 |
 
-All three arms drift upward over training because response and context lengths
-grow, so this metric is only comparable at matched steps. The frozen arm's
-jump to ~15 ms/token after step 195 is that effect, not a regression — its
-tool-use depth roughly doubles there (see below).
+Use the decode column. It tracks acceptance length the way theory says it
+should — decode cost per token should scale as 1/acceptance, and at steps
+150-190 the acceptance ratio is 2.43/2.02 = 1.20 against a decode-time ratio of
+8.81/7.46 = 1.18.
+
+**Speculation is worth roughly 1.8-2.1x on decode.** The per-request series only
+overlaps the BF16 chain from step 227 (15.01 ms/token at ~12.5 turns); against
+it the frozen arm reaches 8.41 ms/token while running *deeper* rollouts (15.7
+turns, so longer contexts and slower decode all else equal), which makes 1.8x a
+conservative floor, and the trained arm's 7.04 puts it near 2.1x. The
+matched-behavior HTTP window early in training (steps 10-60, all arms at ~2.3
+turns) agrees: 6.7 vs 12.9 = 1.93x.
+
+Drafter training is second-order against that: ~6% on decode (7.04 vs 8.41),
+on top of the ~2x speculation itself buys.
 
 Mismatch KL sits in the same 1.1-1.8x10^-3 band in all three arms across all
 200 steps, which is the check that speculation is not skewing the rollout
