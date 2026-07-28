@@ -3,7 +3,7 @@
 > **Status**: companion to `fp8_rollout_30b/REPORT.md`. Same model, harness,
 > cluster and operating point, so the two rollout-acceleration levers (FP8
 > weight quantization and speculative decoding) are directly comparable. Data
-> through 200 matched training steps (the frozen arm ran to 221).
+> through 210 matched training steps (the frozen arm ran to 221).
 
 ## Settings
 
@@ -67,8 +67,8 @@ moves underneath it.**
 
 ![results dynamics](figures/results_dynamics.svg)
 
-The paired difference is positive at **all 200 matched steps** (mean +0.2971,
-sd 0.1201, t=35.0). Decomposed into 25-step blocks:
+The paired difference is positive at **all 210 matched steps** (mean +0.3079,
+sd 0.1270, t=35.1). Decomposed into 25-step blocks:
 
 | steps | online | frozen | delta | advantage |
 |---|---|---|---|---|
@@ -80,6 +80,7 @@ sd 0.1201, t=35.0). Decomposed into 25-step blocks:
 | 126-150 | 2.425 | 2.038 | +0.387 | +19.0% |
 | 151-175 | 2.420 | 2.026 | +0.394 | +19.5% |
 | 176-200 | 2.444 | 2.010 | +0.434 | +21.6% |
+| 201-210 | 2.505 | 1.983 | +0.523 | +26.4% |
 
 **Two mechanisms fire in sequence, and they trade off around step 50.**
 
@@ -90,22 +91,24 @@ over the last 120 steps the online arm's slope is +0.0005/step, i.e. it sits
 on a plateau near 2.44 and stops improving.
 
 *Late — staleness.* The frozen drafter decays monotonically once adaptation is
-over: -0.0008/step across the last 120 steps, from a peak of 2.21 down to
-1.96, a **14.3% loss**. It ends up **4.4% below the offline-drafter baseline
+over: -0.0008/step across the last 120 steps, from a peak of 2.28 down to
+1.98, a **13.5% loss**. It ends up **4.9% below the offline-drafter baseline
 it started from**, so a drafter that is merely "good at the base model" is
 worse than useless once the policy has moved 200 steps. Every bit of the
 delta's growth after step 50 comes from this side.
 
 The practical consequence is the important one: the online arm's advantage
-**does not converge**. It grows monotonically block over block (+3.9% → +21.6%)
+**does not converge**. It grows monotonically block over block (+3.9% → +26.4%)
 and is still widening at cutoff, because the driver is policy drift, which
 continues as long as training does. This is the opposite of the reading a short
 run gives — at 40 steps the same experiment showed a saturating ~+10% and
 attributed it to adaptation.
 
-**Net at 200 steps**: +23.1% tokens per draft over the last 10 matched steps
-(online 2.472 vs frozen 2.008); online is +17.8% over the offline baseline
-while frozen is -4.4% under it.
+**Net at the 210-step cutoff**: +24.2% tokens per draft over the last 25
+matched steps (online 2.479 vs frozen 1.996); the last 10 steps read +26.4%
+and the last 50 +22.0%, so the trailing window matters at the margin and the
+advantage is still opening. Against the offline-drafter baseline the trained
+arm is +18.0% while the frozen arm is -4.9%.
 
 ## Rollout performance
 
@@ -131,8 +134,8 @@ the decode cost essentially flat across that transition (8.81 → 8.41).
 | | HTTP ms/token | 6.69 | 7.08 | 12.90 |
 | steps 150-190 | decode ms/token | 7.46 | 8.81 | — |
 | | HTTP ms/token | 8.47 | 8.98 | 15.97 |
-| steps 200-221 | decode ms/token | 7.04 | 8.41 | — |
-| | HTTP ms/token | 7.90 | 14.10 | 16.52 |
+| steps 200-221 | decode ms/token | 6.93 | 8.41 | — |
+| | HTTP ms/token | 7.69 | 14.10 | 16.52 |
 | steps 227-243 | decode ms/token | — | — | 15.01 |
 
 Use the decode column. It tracks acceptance length the way theory says it
@@ -144,11 +147,11 @@ should — decode cost per token should scale as 1/acceptance, and at steps
 overlaps the BF16 chain from step 227 (15.01 ms/token at ~12.5 turns); against
 it the frozen arm reaches 8.41 ms/token while running *deeper* rollouts (15.7
 turns, so longer contexts and slower decode all else equal), which makes 1.8x a
-conservative floor, and the trained arm's 7.04 puts it near 2.1x. The
+conservative floor, and the trained arm's 6.93 puts it near 2.2x. The
 matched-behavior HTTP window early in training (steps 10-60, all arms at ~2.3
 turns) agrees: 6.7 vs 12.9 = 1.93x.
 
-Drafter training is second-order against that: ~6% on decode (7.04 vs 8.41),
+Drafter training is second-order against that: ~18% on decode (6.93 vs 8.41),
 on top of the ~2x speculation itself buys.
 
 Mismatch KL sits in the same 1.1-1.8x10^-3 band in all three arms across all
@@ -196,7 +199,7 @@ this feature on a MoE policy, since it forfeits permute fusion.
   **1.81x** (8.6 → 15.7 turns) while its acceptance moves **-0.040**
   (2.006 → 1.966); across the online arm's, depth grows 1.36x and acceptance
   moves +0.022. A near-doubling of rollout structure is therefore worth about
-  ±0.04 acceptance — an order of magnitude below the +0.40 to +0.47 gap between
+  ±0.04 acceptance — an order of magnitude below the +0.43 to +0.52 gap between
   the arms at the same steps. Behavioral divergence cannot account for the
   result. A cross-evaluation of both drafters against one policy checkpoint
   would tighten this further but is not needed to support the conclusion.
