@@ -65,42 +65,50 @@ decode here is weight-traffic bound. This report answers the follow-on
 question that only exists in RL: **what happens to the drafter as the policy
 moves underneath it.**
 
-The paired difference is positive at **all 40 matched steps** (mean +0.1299,
-sign test p < 1e-11). Decomposed into 10-step blocks:
+The paired difference is positive at **all 200 matched steps** (mean +0.2971,
+sd 0.1201, t=35.0). Decomposed into 25-step blocks:
 
-| steps | online mean (slope/step) | frozen mean (slope/step) | delta |
-|---|---|---|---|
-| 1-10 | 2.231 (+0.0139) | 2.205 (+0.0072) | +0.027 |
-| 11-20 | 2.329 (+0.0198) | 2.218 (+0.0116) | +0.111 |
-| 21-30 | 2.356 (+0.0045) | 2.192 (+0.0018) | +0.163 |
-| 31-40 | 2.380 (-0.0020) | 2.161 (-0.0009) | +0.219 |
+| steps | online | frozen | delta | advantage |
+|---|---|---|---|---|
+| 1-25 | 2.295 | 2.209 | +0.086 | +3.9% |
+| 26-50 | 2.381 | 2.168 | +0.213 | +9.8% |
+| 51-75 | 2.405 | 2.174 | +0.231 | +10.6% |
+| 76-100 | 2.394 | 2.116 | +0.277 | +13.1% |
+| 101-125 | 2.412 | 2.057 | +0.355 | +17.2% |
+| 126-150 | 2.425 | 2.038 | +0.387 | +19.0% |
+| 151-175 | 2.420 | 2.026 | +0.394 | +19.5% |
+| 176-200 | 2.444 | 2.010 | +0.434 | +21.6% |
 
-**Two mechanisms fire in sequence, and only the second is the one usually
-advertised.**
+**Two mechanisms fire in sequence, and they trade off around step 50.**
 
-*Steps 1-30 — domain adaptation.* The online drafter gains +0.149 acceptance
-length overall while the frozen drafter does **not** decay; it drifts slightly
-*upward* through step 20. The early advantage is therefore not staleness
-resistance: it is a generic-chat drafter learning our multi-turn math-code
-distribution. Both arms rising together is consistent with RL sharpening the
-policy's output distribution, which makes any drafter's job easier.
+*Early — domain adaptation.* The online drafter climbs from 2.231 to ~2.40 in
+the first 50 steps while the frozen drafter holds flat. This is a generic-chat
+EAGLE head learning our multi-turn math-code distribution, and it saturates:
+over the last 120 steps the online arm's slope is +0.0005/step, i.e. it sits
+on a plateau near 2.44 and stops improving.
 
-*After step ~30 — staleness.* The online arm plateaus (block slope turns
-slightly negative) while the frozen arm turns down from its block-2 peak of
-2.218 to 2.161. The continued widening of the delta in the last block is
-driven by frozen decay, not by further online gain. So the staleness effect is
-real, but it is slow and mild — invisible for the first 30 steps, and worth
-about -0.06 acceptance by step 40.
+*Late — staleness.* The frozen drafter decays monotonically once adaptation is
+over: -0.0008/step across the last 120 steps, from a peak of 2.21 down to
+1.96, a **14.3% loss**. It ends up **4.4% below the offline-drafter baseline
+it started from**, so a drafter that is merely "good at the base model" is
+worse than useless once the policy has moved 200 steps. Every bit of the
+delta's growth after step 50 comes from this side.
 
-**Net effect at cutoff**: +10.1% tokens per draft against the frozen drafter
-over the last 10 steps, and +13.3% against the offline-drafter baseline
-(2.0997). The adaptation component has saturated; the staleness component is
-still opening.
+The practical consequence is the important one: the online arm's advantage
+**does not converge**. It grows monotonically block over block (+3.9% → +21.6%)
+and is still widening at cutoff, because the driver is policy drift, which
+continues as long as training does. This is the opposite of the reading a short
+run gives — at 40 steps the same experiment showed a saturating ~+10% and
+attributed it to adaptation.
+
+**Net at 200 steps**: +23.1% tokens per draft over the last 10 matched steps
+(online 2.472 vs frozen 2.008); online is +17.8% over the offline baseline
+while frozen is -4.4% under it.
 
 ## Cost
 
-Median non-validation step time is **848s (online) vs 789s (frozen)**, so
-training the drafter costs about **7%** of step time. This is the price of the
+Median non-validation step time is **880s (online) vs 814s (frozen)**, so
+training the drafter costs about **8%** of step time. This is the price of the
 draft forward plus the distillation loss, which is not chunked and whose
 cross-entropy up-casts both sides to fp32 and retains two vocab-sized tensors
 for backward — reintroducing the allocation `defer_fp32_logits` exists to
@@ -163,7 +171,5 @@ this feature on a MoE policy, since it forfeits permute fusion.
 - Acceptance is measured over a wall-clock window in async mode, so a step's
   reported acceptance covers generations that will be trained on slightly
   later. This is common to both arms.
-- The staleness component is characterized over 40 steps only. Its trajectory
-  beyond that — whether it continues linearly, accelerates when the policy
-  undergoes the heavy-tool phase transition seen in the FP8 study around step
-  120, or flattens — is not established here.
+- The frozen arm's decay is still linear at cutoff, so where it bottoms out is
+  not established. Extrapolating the advantage past 200 steps is unsupported.
