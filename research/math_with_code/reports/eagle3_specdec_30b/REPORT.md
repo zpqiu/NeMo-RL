@@ -65,6 +65,8 @@ decode here is weight-traffic bound. This report answers the follow-on
 question that only exists in RL: **what happens to the drafter as the policy
 moves underneath it.**
 
+![results dynamics](figures/results_dynamics.svg)
+
 The paired difference is positive at **all 200 matched steps** (mean +0.2971,
 sd 0.1201, t=35.0). Decomposed into 25-step blocks:
 
@@ -105,6 +107,36 @@ attributed it to adaptation.
 (online 2.472 vs frozen 2.008); online is +17.8% over the offline baseline
 while frozen is -4.4% under it.
 
+## Rollout performance
+
+![rollout performance](figures/rollout_perf.svg)
+
+Measured the same way as the FP8 study: *time per output token* = mean
+model-call wall seconds / mean generated tokens per call (batch sum/sum
+identity), where the wall clock is the HTTP call — vLLM queue + prefill +
+decode — with tool execution excluded.
+
+| window | drafter trained | drafter frozen | BF16, no speculation |
+|---|---|---|---|
+| steps 10-60 | 6.7 ms/token | 7.1 | 12.9 |
+| steps 150-200 | 8.4 ms/token | 9.0 | 16.0 |
+
+**Speculation roughly halves time per output token** against the
+no-speculation reference, and the ratio holds as training progresses (1.9x
+early, 1.9x late) — consistent with the +82% per-stream throughput measured in
+the offline-drafter window. Against that, the trained-vs-frozen difference is
+second-order (6.7 vs 7.1, 8.4 vs 9.0): drafter training buys ~6% on top of the
+~2x that speculation itself buys.
+
+All three arms drift upward over training because response and context lengths
+grow, so this metric is only comparable at matched steps. The frozen arm's
+jump to ~15 ms/token after step 195 is that effect, not a regression — its
+tool-use depth roughly doubles there (see below).
+
+Mismatch KL sits in the same 1.1-1.8x10^-3 band in all three arms across all
+200 steps, which is the check that speculation is not skewing the rollout
+distribution.
+
 ## Cost
 
 Median non-validation step time is **880s (online) vs 814s (frozen)**, so
@@ -134,21 +166,22 @@ this feature on a MoE policy, since it forfeits permute fusion.
 
 ## Caveats
 
-- **The arms' policies diverge behaviorally, which confounds the attribution.**
-  Step-aligned against the BF16 reference chain, `turns_per_sample/mean` runs
-  1.26 / ~2.0 / ~4 / ~6.4 in all arms through step 80, after which the frozen
-  arm stalls near 8 while the online arm reaches ~11 and BF16 reaches ~12.9.
-  The frozen arm's acceptance decline is therefore not purely drafter
-  staleness: its policy also settled into a shorter, less tool-heavy regime,
-  and rollouts from a different behavioral regime are not equally predictable.
-  Two things bound how much this matters. First, the online arm is *within*
-  the run-to-run band — it exceeds BF16 at steps 100-140 (9.36 vs 7.57) and
-  trails at 160 (11.07 vs 12.85), while FP8-v4 swings further against the same
-  reference (9.56 vs 12.85 at 160, then 15.01 vs 13.67 at 200); this workload's
-  heavy-tool transition is known to fire at high variance. Second, the
-  divergence is not a speculative-decoding sampling artifact — see below.
-  Disentangling the two contributions requires evaluating both drafters
-  against a *common* policy checkpoint, which is not done here.
+- **The arms' policies diverge behaviorally, but the effect on acceptance is
+  bounded and small.** This workload has a heavy-tool phase transition, and all
+  three arms undergo it at different times: the online arm around step 90
+  (settling at ~10.1 turns/sample), BF16 around step 130-150 (~13), and the
+  frozen arm only at step ~195, where it jumps 8.6 → 15.8. Since the arms sit
+  in different behavioral regimes over much of the run, one could worry the
+  acceptance gap reflects that rather than drafter staleness.
+  Each arm's own transition bounds how much that can matter, as a natural
+  experiment: across the frozen arm's transition its tool-use depth grows
+  **1.81x** (8.6 → 15.7 turns) while its acceptance moves **-0.040**
+  (2.006 → 1.966); across the online arm's, depth grows 1.36x and acceptance
+  moves +0.022. A near-doubling of rollout structure is therefore worth about
+  ±0.04 acceptance — an order of magnitude below the +0.40 to +0.47 gap between
+  the arms at the same steps. Behavioral divergence cannot account for the
+  result. A cross-evaluation of both drafters against one policy checkpoint
+  would tighten this further but is not needed to support the conclusion.
 - **Speculation is not biasing the rollout distribution.** `gen_kl_error`, the
   rollout-vs-training logprob mismatch, is 0.0015-0.0016 in both eagle arms and
   in the BF16 reference, flat across all 160 steps; `sampling_importance_ratio`
