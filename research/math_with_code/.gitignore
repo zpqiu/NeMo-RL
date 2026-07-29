@@ -4,3 +4,11 @@ archive/
 
 # Cluster-specific launchers carrying private account/storage paths.
 experiments/
+
+# Report plumbing: raw per-step telemetry pulled from wandb, plus the scripts
+# that pull it and render the figures. These carry the internal wandb entity
+# and cluster paths, so they stay local while the distilled report and its
+# figures are committed -- same split as /reports/ in the root .gitignore.
+reports/*/data/
+reports/*/pull_wandb.py
+reports/*/make_figures.py

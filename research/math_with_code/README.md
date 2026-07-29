@@ -252,10 +252,13 @@ for diagnosis and are worth purging occasionally to protect shared-fs inodes.
 - [`reports/fp8_rollout_30b/REPORT.md`](reports/fp8_rollout_30b/REPORT.md) —
   FP8 rollout for multi-turn agentic RL on the 30B MoE, structured after (and
   destined to merge into) the single-turn `low-precision-rl-tech-report`:
-  BF16 reference curves, FP8 (router BF16) tracking-or-beating them, and the
+  BF16 reference curves, FP8 (router BF16) tracking-or-beating them, the
   router-precision ablation showing quantized routing suppresses the task's
-  tool-use phase transition. Curves are stitched from the wandb chains in
-  `nv-welcome/grpo-math-with-code`.
+  tool-use phase transition, and the end-to-end arm (FP8 rollout + FP8
+  Megatron training) that wins on accuracy/KL/entropy but loses 3–6% training
+  throughput on GB200's blockwise recipe. Curves are stitched from the run's
+  wandb chains; the pull/render scripts and the raw per-step CSVs stay local
+  (see this directory's `.gitignore`).
 
 ## Residual diffs outside this directory
 
