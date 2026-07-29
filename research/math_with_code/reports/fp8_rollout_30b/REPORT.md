@@ -39,9 +39,10 @@ entropy* and (vi) *tool calls per rollout* — the task exhibits a phase
 transition into heavy tool use, and whether that transition fires is the most
 sensitive indicator of rollout-precision side effects we observed. Rollout
 speed is measured by (vii) *time per output token* (ms/token) during
-generation, as in the tech report: mean model-call wall-clock seconds ÷ mean
-generated tokens per call (the batch-mean ratio equals Σseconds/Σtokens; the
-wall clock is the HTTP call covering vLLM queueing, prefill, and decode,
+generation, as in the tech report: mean model-call wall-clock seconds per
+rollout ÷ mean generated tokens per rollout (the batch-mean ratio equals
+Σseconds/Σtokens; the wall clock is the HTTP call covering vLLM queueing,
+prefill, and decode,
 excluding tool execution). It measures per-request serving speed at matched
 load — lower is better — without baking concurrency into the number. The
 end-to-end FP8 section adds (viii) *training throughput*
@@ -73,10 +74,11 @@ before the tool-use transition) with no observed accuracy cost.
 
 **Multi-turn observations.** The agentic task adds a behavioral dimension
 absent from single-turn RL: around step 130 the BF16 policy transitions into a
-heavy-tool-use regime (~7 to ~14 calls/rollout) that drives the late accuracy
-gains. FP8 rollout undergoes the same transition roughly 50 steps later and
-converges to ~15 calls/rollout — rollout quantization delays but does not
-suppress the behavioral phase transition, provided the router stays in BF16.
+heavy-tool-use regime (~7 to ~14 calls/rollout), coinciding with the late
+accuracy gains. FP8 rollout undergoes the same transition roughly 50 steps
+later and converges to ~15 calls/rollout — rollout quantization delays but
+does not suppress the behavioral phase transition, provided the router stays
+in BF16.
 
 **Rollout performance.**
 
@@ -92,15 +94,14 @@ trace.*
 | steps 150–200 (late behavior: heavy tool use, ~12k-token trajectories) | 16.0 ms/token | 14.1 ms/token | −12.1% |
 
 FP8 rollout generates each token ~16% faster at matched early-training load.
-The metric is behavior-dependent — it degrades for both arms as trajectories
-shift toward many short model calls, because a growing share of wall time
-goes to costs FP8 does not accelerate: per-call queueing/scheduling overhead
-and KV-cache attention traffic (the KV cache stays BF16 in both arms).
-Prefill compute does benefit from FP8 GEMMs, but over long multi-turn
-histories prefill itself becomes increasingly KV-bound. Cross-arm deltas are
-therefore only meaningful while the arms remain behaviorally matched; after
-the FP8 arm's later tool-use transition (~step 180) the two curves converge
-as expected.
+The metric is strongly behavior-dependent, and specifically it rises with
+trajectory length: within each arm, regressing ms/token on tokens/sample over
+steps 1–200 gives r = 0.95–0.97 with a slope of 0.69–0.82 ms/token per
+additional 1k tokens/sample. We have not profiled the generation path, so this
+report does not attribute that dependence to particular costs. The practical
+consequence is what matters for reading the table: cross-arm deltas are only
+meaningful while the arms are at comparable trajectory lengths, and after the
+FP8 arm's later tool-use transition (~step 180) the two curves converge.
 
 Validation adds an end-to-end cross-check. Every 10 steps both arms run the
 identical AIME burst — 480 rollouts (30 tasks x 16) submitted together — and
@@ -134,6 +135,17 @@ concentrated in the hard problems solved only through heavy tool iteration.
 Excluding the router from quantization (blue) arrests all three at no
 measurable cost.
 
+Mechanism, consistent with the single-turn KL evidence: vLLM's on-the-fly
+`Fp8Config` quantizes the router gate (`ReplicatedLinear`) by default, and
+router noise flips top-8 expert selection near decision boundaries — a
+discrete computation-path perturbation rather than smooth numeric error. The
+RL loop then amplifies the sharpened sampling distribution, and importance
+sampling cannot recover trajectories that were never explored. Fix (NeMo-RL):
+`quantization_ignored_layer_kws: ["mlp.gate"]`. The official
+Qwen3-30B-A3B-Instruct-2507-FP8 checkpoint likewise excludes all 48 `mlp.gate`
+layers, and the Megatron trainer runs the router in FP32
+(`moe_router_dtype`).
+
 ## End-to-End FP8: FP8 Rollout Plus FP8 Training
 
 Everything above keeps training in BF16. This section adds the training side:
@@ -143,10 +155,16 @@ rollout. Config:
 200 steps, otherwise identical data and hyperparameters.
 
 **What changes.** Trainer: `fp8: hybrid` (forward activations/weights e4m3,
-backward grads e5m2), `fp8_recipe: blockwise`, `fp8_param: false` so master
-weights stay BF16 and refit re-quantizes from BF16 exactly as in the
-rollout-only arm. The training-side quantization surface is TE
-`Linear`/`GroupedLinear` GEMMs only — attention (`fp8_dpa` off), embeddings,
+backward grads e5m2), `fp8_recipe: blockwise`, `fp8_param: false`. That last
+flag governs *model parameter storage*, not optimizer state: Megatron consults
+it only at module init (`config.fp8 if not is_init else config.fp8_param`,
+`megatron/core/fp8_utils.py`), so leaving it false keeps parameters as
+ordinary BF16 tensors instead of TE quantized tensors, and refit re-quantizes
+from BF16 exactly as in the rollout-only arm. The optimizer's master weights
+are FP32 in every arm here — Megatron's `main_params_dtype` defaults to
+`torch.float32` and NeMo-RL does not expose or override it. The training-side
+quantization surface is TE `Linear`/`GroupedLinear` GEMMs only — attention
+(`fp8_dpa` off), embeddings,
 lm_head, and the MoE router (`moe_router_dtype: fp32`) stay high precision,
 mirroring the rollout's router exclusion. Rollout: scale factors switch to
 power-of-2 (`pow2_weight_scaling_factors`, `pow2_activation_scaling_factors`).
@@ -174,37 +192,57 @@ the highest of the three (0.853 vs 0.849/0.843, steps 150–200 median). The run
 reached step 200 without divergence and with no visible instability in any
 tracked series.
 
-**Grid alignment shows up in the mismatch KL.** Mismatch KL settles at ~0.0036
-(steps 150–200) versus the rollout-only FP8 arm's ~0.0043 — about 16% lower,
-and flat across the run rather than drifting. Both remain above BF16's
-~0.0016; quantization error does not disappear, but sharing one quantization
-grid between rollout and trainer measurably reduces the policy mismatch the
-FP8 rollout introduces.
+**Mismatch KL is lower than the rollout-only arm's.** It settles at ~0.0036
+(steps 150–200) versus ~0.0043 — about 16% lower — and is flat across the run
+rather than drifting. Both remain above BF16's ~0.0016. Which of the two
+deltas produces the reduction is not identified by this run; the pow2 grid
+alignment is the motivating hypothesis, but testing it requires the pow2
+rollout with a BF16 trainer, which was not run.
 
-**The entropy gap closes.** Rollout-only FP8 ran persistently below the
-reference and declined late (~0.26 by steps 150–200). End-to-end FP8 tracks
-the BF16 reference instead (0.332 vs 0.342). It also transitions into heavy
-tool use at step ~152 — between BF16's ~132 and rollout-only FP8's ~160 — and
-sustains the longest trajectories of the three (~13.2k tokens/sample at
-steps 150–200 vs BF16's ~10.4k), i.e. the exploration behavior that drives the
-late accuracy gains is preserved, not suppressed.
+**Entropy tracks the BF16 reference.** Rollout-only FP8 ran persistently below
+the reference and declined late (~0.26 by steps 150–200); end-to-end FP8 sits
+at 0.332 against BF16's 0.342. It transitions into heavy tool use at step
+~152 — between BF16's ~132 and rollout-only FP8's ~160 — and sustains the
+longest trajectories of the three (~13.2k tokens/sample at steps 150–200 vs
+BF16's ~10.4k). So on every behavioral metric tracked here the arm stays at
+or above the BF16 reference rather than below it, which is the failure mode
+the router ablation above exhibits.
 
-**Rollout speed: most of the FP8 win survives.**
+**Rollout speed.**
 
 | window | BF16 | FP8 rollout | FP8 end-to-end |
 |---|---|---|---|
-| steps 10–60 (matched behavior) | 12.9 ms/token | 10.8 ms/token (−16.2%) | 11.1 ms/token (−13.7%) |
-| steps 150–200 (behavior-confounded) | 16.0 ms/token | 14.1 ms/token (−12.1%) | 16.4 ms/token (+2.7%) |
+| steps 10–60 | 12.9 ms/token | 10.8 ms/token (−16.2%) | 11.1 ms/token (−13.7%) |
+| steps 150–200 | 16.0 ms/token | 14.1 ms/token (−12.1%) | 16.4 ms/token (+2.7%) |
 
-In the early matched-behavior window the end-to-end arm keeps most of the
-rollout speedup; the ~2.5-point give-back against the rollout-only arm is the
-cost of the pow2/`use_ue8m0` activation-quant kernel path relative to vLLM's
-stock non-pow2 cast. The late window is not a like-for-like comparison — by
-step 150 the end-to-end arm is generating ~12% longer trajectories with more
-tool calls than the FP8-rollout arm, and as §"Rollout performance" notes, this
-metric degrades with that behavior shift for reasons FP8 does not address. The
-matched-load validation burst agrees with the early window: median 189 s
-versus BF16's 202 s (−6.4%) and the FP8-rollout arm's 178 s.
+**Neither window is behaviorally matched for this arm**, so read the raw
+numbers with care: the end-to-end arm runs longer trajectories than the
+FP8-rollout arm throughout — already +14% at steps 10–60 (7380 vs 6491
+tokens/sample) and +12% by step 150 — and as §"Rollout performance" notes,
+ms/token rises with trajectory length within every arm.
+That dependence is near-linear and dominant: regressing
+ms/token on tokens/sample over steps 1–200 gives r = 0.95–0.97 and a slope of
+0.69–0.82 ms/token per additional 1k tokens/sample. Evaluated at the
+end-to-end arm's own early-window length, the FP8-rollout arm's fit predicts
+11.5 ms/token against the end-to-end arm's observed 11.1. On that basis the
+raw 10.8 → 11.1 difference is within what the length gap alone accounts for,
+and the observations are consistent with the FP8 rollout speedup carrying
+over to this arm. The matched-load validation burst is the one directly
+measured end-to-end comparison and points the same way: median 189 s versus
+BF16's 202 s (−6.4%), with the FP8-rollout arm at 178 s on its own shorter
+trajectories.
+
+This is a length-controlled inference from a two-arm fit, not a direct
+measurement, and it is as far as the data supports — we did not profile the
+generation path, so no claim is made here about which kernels account for
+any residual. The per-request vLLM window means
+(`train/vllm/request_{queue,prefill,decode}_time_mean_s`,
+`time_to_first_token_mean_s`) that would separate serving speed from queueing
+and prefill were instrumented after this campaign: they cover only the final
+segments of the BF16 and FP8-rollout chains (steps 227–243 and 206–221
+respectively, non-overlapping) and have zero coverage on the end-to-end run.
+Settling the question needs a short re-run of both arms with that
+instrumentation live.
 
 **Training speed: no gain — this is the arm's negative result.**
 
@@ -225,30 +263,36 @@ FP8 training is 3–6% *slower* than BF16 training at matched load, consistently
 across the token range (medians over steps 1–200, n = 27–67 steps per cell).
 The FP8-rollout arm, whose trainer is BF16, sits at BF16 parity as expected —
 so the regression is attributable to the trainer, not to the rollout or to
-run-to-run noise. The leading explanation is the one the config records: on
-sm100 the blockwise recipe is serviced by TE's MXFP8-emulated path (TE PR
-\#2157) rather than a native blockwise kernel, so the FP8 GEMMs pay
-quantize/dequantize overhead without collecting the matching kernel speedup.
+run-to-run noise.
 
-**Takeaway.** End-to-end FP8 is safe for this workload and is the best arm on
-accuracy, mismatch KL, and entropy preservation — but on GB200 with the
-blockwise recipe it costs training throughput instead of saving it, so on this
-hardware it is currently a quality result rather than a performance one. The
-obvious follow-up is the Blackwell-native `mxfp8` recipe (32-block, E8M0),
-wired up as `configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_mxfp8.yaml`;
-it should test whether the throughput regression is an emulation artifact
-while retaining the grid-alignment benefits. A second open question this arm
-cannot answer: whether the lower KL and restored entropy come from pow2 grid
-alignment alone, which would make pow2 rollout scales worth adopting even with
-a BF16 trainer, at no throughput cost.
+We did not profile the training step, so this report does not attribute the
+3–6% to a specific cost. Two pieces of upstream context are worth recording
+because they make the direction unsurprising rather than anomalous. First,
+cuBLASLt has no native FP8 block-scaling GEMM on Blackwell, so
+[TE PR #2157](https://github.com/NVIDIA/TransformerEngine/pull/2157)
+implements the recipe there by *emulation* — "This PR emulates only the GEMMs
+with MXFP8. This is done by converting input tensors to MXFP8 just before a
+GEMM" — which adds a per-GEMM format conversion and, per the same PR, gives
+up GEMM+GELU fusion on Blackwell. (That PR is also why pow2 scales are
+mandatory rather than optional here: the block-scaling → MXFP8 conversion is
+lossless only when the scale factors are powers of two.) Second, NeMo-RL's
+own `docs/fp8.md` recommends FP8 generation with **BF16 training** on
+Blackwell, so this arm deliberately runs a configuration the documentation
+does not yet recommend for this hardware. Confirming the cause needs a
+kernel-level profile of the two trainers, which we have not run.
 
-Mechanism, consistent with the single-turn KL evidence: vLLM's on-the-fly
-`Fp8Config` quantizes the router gate (`ReplicatedLinear`) by default, and
-router noise flips top-8 expert selection near decision boundaries — a
-discrete computation-path perturbation rather than smooth numeric error. The
-RL loop then amplifies the sharpened sampling distribution, and importance
-sampling cannot recover trajectories that were never explored. Fix (NeMo-RL):
-`quantization_ignored_layer_kws: ["mlp.gate"]`. The official
-Qwen3-30B-A3B-Instruct-2507-FP8 checkpoint likewise excludes all 48 `mlp.gate`
-layers, and the Megatron trainer runs the router in FP32
-(`moe_router_dtype`).
+**Takeaway.** Over 200 steps the end-to-end arm trained without instability
+and was the best of the three on accuracy, mismatch KL, and entropy, while
+costing 3–6% training throughput on GB200 with the blockwise recipe. On this
+hardware it is therefore a quality result rather than a performance one.
+
+Two questions this campaign leaves open, both requiring a run it did not
+include:
+
+- *Does the throughput regression survive a Blackwell-native recipe?* The
+  `mxfp8` recipe (32-block, E8M0) is wired up as
+  `configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_mxfp8.yaml` and is
+  the direct test.
+- *Which of the two deltas produced the KL and entropy improvements?* Running
+  pow2 rollout scales against a BF16 trainer separates them. If the effect is
+  pow2 alone, it is available at no throughput cost.
