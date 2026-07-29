@@ -194,10 +194,8 @@ tracked series.
 
 **Mismatch KL is lower than the rollout-only arm's.** It settles at ~0.0036
 (steps 150–200) versus ~0.0043 — about 16% lower — and is flat across the run
-rather than drifting. Both remain above BF16's ~0.0016. Which of the two
-deltas produces the reduction is not identified by this run; the pow2 grid
-alignment is the motivating hypothesis, but testing it requires the pow2
-rollout with a BF16 trainer, which was not run.
+rather than drifting. Both remain above BF16's ~0.0016. This arm moves two
+things at once, so it does not identify which of them produces the reduction.
 
 **Entropy tracks the BF16 reference.** Rollout-only FP8 ran persistently below
 the reference and declined late (~0.26 by steps 150–200); end-to-end FP8 sits
@@ -241,8 +239,6 @@ any residual. The per-request vLLM window means
 and prefill were instrumented after this campaign: they cover only the final
 segments of the BF16 and FP8-rollout chains (steps 227–243 and 206–221
 respectively, non-overlapping) and have zero coverage on the end-to-end run.
-Settling the question needs a short re-run of both arms with that
-instrumentation live.
 
 **Training speed: no gain — this is the arm's negative result.**
 
@@ -278,21 +274,9 @@ mandatory rather than optional here: the block-scaling → MXFP8 conversion is
 lossless only when the scale factors are powers of two.) Second, NeMo-RL's
 own `docs/fp8.md` recommends FP8 generation with **BF16 training** on
 Blackwell, so this arm deliberately runs a configuration the documentation
-does not yet recommend for this hardware. Confirming the cause needs a
-kernel-level profile of the two trainers, which we have not run.
+does not yet recommend for this hardware.
 
 **Takeaway.** Over 200 steps the end-to-end arm trained without instability
 and was the best of the three on accuracy, mismatch KL, and entropy, while
 costing 3–6% training throughput on GB200 with the blockwise recipe. On this
 hardware it is therefore a quality result rather than a performance one.
-
-Two questions this campaign leaves open, both requiring a run it did not
-include:
-
-- *Does the throughput regression survive a Blackwell-native recipe?* The
-  `mxfp8` recipe (32-block, E8M0) is wired up as
-  `configs/grpo_math_with_code_qwen3_30ba3b_instruct_async_mxfp8.yaml` and is
-  the direct test.
-- *Which of the two deltas produced the KL and entropy improvements?* Running
-  pow2 rollout scales against a BF16 trainer separates them. If the effect is
-  pow2 alone, it is available at no throughput cost.
