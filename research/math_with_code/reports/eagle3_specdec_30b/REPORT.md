@@ -3,7 +3,9 @@
 > **Status**: companion to `fp8_rollout_30b/REPORT.md`. Same model, harness,
 > cluster and operating point, so the two rollout-acceleration levers (FP8
 > weight quantization and speculative decoding) are directly comparable. Data
-> through 210 matched training steps (the frozen arm ran to 221).
+> through 210 matched training steps (the frozen arm ran to 221). A
+> byte-identical BF16 replicate was run alongside to measure how much of
+> the behavioral spread between arms is simply run-to-run variance.
 
 ## Settings
 
@@ -29,12 +31,15 @@ vLLM runs it with `num_speculative_tokens=3`, `draft_tensor_parallel_size=1`.
 > restores acceptance 2.184 at a 6875-token prompt. All results below use the
 > patched copy.
 
-**Arms.** Two otherwise byte-identical configurations:
+**Arms.** Two otherwise byte-identical configurations, plus two
+no-speculation BF16 chains that differ from each other only in async
+nondeterminism:
 
 | arm | `policy.draft.enabled` | drafter during RL |
 |---|---|---|
 | online | true | trained with the policy; `draft.*` weights refit into vLLM each step |
 | frozen | false | fixed at the initial checkpoint while the policy trains |
+| BF16 / BF16 replicate | — | no speculative decoding; reference and its own replicate |
 
 Online draft training requires the Megatron backend and forbids sequence
 packing, so **packing is disabled in both arms** to keep that cost common-mode.
@@ -128,28 +133,28 @@ reference, while its acceptance length is unchanged at ~1.99 — it had not lost
 any speculative benefit. Splitting out vLLM's own per-request decode time shows
 the decode cost essentially flat across that transition (8.81 → 8.41).
 
-| window | metric | trained | frozen | BF16 |
+| window | metric | trained | frozen | BF16 replicate |
 |---|---|---|---|---|
-| steps 10-60 | decode ms/token | 6.65 | 6.80 | — |
-| | HTTP ms/token | 6.69 | 7.08 | 12.90 |
-| steps 150-190 | decode ms/token | 7.46 | 8.81 | — |
-| | HTTP ms/token | 8.47 | 8.98 | 15.97 |
-| steps 200-221 | decode ms/token | 6.93 | 8.41 | — |
-| | HTTP ms/token | 7.69 | 14.10 | 16.52 |
-| steps 227-243 | decode ms/token | — | — | 15.01 |
+| steps 10-60 | decode ms/token | 6.65 | 6.80 | 12.28 |
+| | HTTP ms/token | 6.69 | 7.08 | 12.64 |
+| steps 150-190 | decode ms/token | 7.46 | 8.81 | 14.90 |
+| | HTTP ms/token | 8.47 | 8.98 | 15.17 |
+| steps 200-221 | decode ms/token | 6.93 | 8.41 | 14.75 |
+| | HTTP ms/token | 7.69 | 14.10 | 17.12 |
 
 Use the decode column. It tracks acceptance length the way theory says it
 should — decode cost per token should scale as 1/acceptance, and at steps
 150-190 the acceptance ratio is 2.43/2.02 = 1.20 against a decode-time ratio of
 8.81/7.46 = 1.18.
 
-**Speculation is worth roughly 1.8-2.1x on decode.** The per-request series only
-overlaps the BF16 chain from step 227 (15.01 ms/token at ~12.5 turns); against
-it the frozen arm reaches 8.41 ms/token while running *deeper* rollouts (15.7
-turns, so longer contexts and slower decode all else equal), which makes 1.8x a
-conservative floor, and the trained arm's 6.93 puts it near 2.2x. The
-matched-behavior HTTP window early in training (steps 10-60, all arms at ~2.3
-turns) agrees: 6.7 vs 12.9 = 1.93x.
+**Speculation is worth roughly 1.8-2.1x on decode.** The BF16 column above is
+the replicate, which carries the per-request split from step 1 (the original
+chain only gained it at step 227, where it reads 15.01 ms/token — consistent).
+The cleanest single number is the early window, where all arms are at ~2.3-2.7
+turns so behavior is matched: **12.28 vs 6.65 = 1.85x**. Later windows agree at
+1.8-2.1x, and there the eagle arms are running *shallower* rollouts than the
+reference in some windows and deeper in others, which the decode metric is far
+less sensitive to than the HTTP wall.
 
 Drafter training is second-order against that: ~18% on decode (6.93 vs 8.41),
 on top of the ~2x speculation itself buys.
@@ -187,36 +192,32 @@ this feature on a MoE policy, since it forfeits permute fusion.
 
 ## Caveats
 
-- **The arms' policies diverge behaviorally, but the effect on acceptance is
-  bounded and small.** This workload has a heavy-tool phase transition, and all
-  three arms undergo it at different times: the online arm around step 90
-  (settling at ~10.1 turns/sample), BF16 around step 130-150 (~13), and the
-  frozen arm only at step ~195, where it jumps 8.6 → 15.8. Since the arms sit
-  in different behavioral regimes over much of the run, one could worry the
-  acceptance gap reflects that rather than drafter staleness.
-  Each arm's own transition bounds how much that can matter, as a natural
+- **The arms diverge behaviorally, and a replicate shows that is intrinsic.**
+  This workload has a heavy-tool phase transition whose timing and plateau vary
+  enormously run to run. A byte-identical replicate of the BF16 chain — same
+  config, same `grpo.seed=42`, differing only in async nondeterminism —
+  transitions 60 steps later than the original and settles 2.7 turns higher:
+
+  | arm | packing | transition step | turns plateau | entropy (steps 40-200) |
+  |---|---|---|---|---|
+  | BF16 | on | 127 | 12.6 | 0.3469 |
+  | BF16 replicate | on | 187 | 15.3 | 0.2866 |
+  | EAGLE-3, trained | off | 77 | 9.7 | 0.2989 |
+  | EAGLE-3, frozen | off | 194 | 15.7 | 0.2936 |
+
+  The two BF16 samples bracket both eagle arms on every column. So neither the
+  tool-use divergence nor the entropy gap can be read as an effect of
+  speculative decoding — and the entropy gap in particular is *not* explained by
+  sequence packing, which was the earlier hypothesis: the replicate runs packing
+  **on** and still sits at 0.2866, below both packing-off eagle arms.
+- **The behavioral divergence also cannot account for the acceptance result**,
+  independently of the above. Each arm's own transition bounds it as a natural
   experiment: across the frozen arm's transition its tool-use depth grows
   **1.81x** (8.6 → 15.7 turns) while its acceptance moves **-0.040**
-  (2.006 → 1.966); across the online arm's, depth grows 1.36x and acceptance
-  moves +0.022. A near-doubling of rollout structure is therefore worth about
-  ±0.04 acceptance — an order of magnitude below the +0.43 to +0.52 gap between
-  the arms at the same steps. Behavioral divergence cannot account for the
-  result. A cross-evaluation of both drafters against one policy checkpoint
-  would tighten this further but is not needed to support the conclusion.
-- **Speculation is not biasing the rollout distribution.** `gen_kl_error`, the
-  rollout-vs-training logprob mismatch, is 0.0015-0.0016 in both eagle arms and
-  in the BF16 reference, flat across all 160 steps; `sampling_importance_ratio`
-  and `probs_ratio` are 1.0000 everywhere. This is the metric that would move
-  first if rejection sampling or the returned logprobs were skewed, and it is
-  the check the FP8 study used for the same purpose. Mechanistically this is
-  also the expected direction: a worse drafter yields more rejections and
-  therefore *more* tokens drawn directly from the target model.
-- Both eagle arms sit ~12% below the BF16 reference in `approx_entropy`
-  (0.287-0.307 vs 0.325-0.359) from step 40 onward — early enough that drafter
-  staleness cannot explain it, and common to both arms, so it points at what
-  they share against the reference (sequence packing disabled) or at these two
-  runs' seeds. Lower entropy is consistent with the weaker/later tool-use
-  transition.
+  (2.006 → 1.966); across the trained arm's, depth grows 1.36x and acceptance
+  moves +0.022. A near-doubling of rollout structure is worth about ±0.04
+  acceptance — an order of magnitude below the +0.43 to +0.52 gap between the
+  arms at the same steps.
 - Single seed per arm. The paired design controls common-mode noise but not
   seed-level differences in the policy trajectory.
 - Consecutive steps are autocorrelated, so the nominal p-values overstate

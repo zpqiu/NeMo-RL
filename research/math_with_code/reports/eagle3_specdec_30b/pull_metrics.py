@@ -44,6 +44,12 @@ CHAINS = {
     "online": "eagle3-online-qwen3-30ba3b-c512-k3-pty",
     "frozen": "eagle3-frozen-qwen3-30ba3b-c512-k3-pty",
     "bf16": "grpo-math-code-B64G16-qwen3-30ba3b-instruct-non8-async-v3-pty",
+    # Byte-identical replicate of the bf16 chain, same grpo.seed=42, run to
+    # measure how far this MoE + workload reproduces its own trajectory. It also
+    # carries the per-request timing split from step 1, which the original chain
+    # only gained at step 227.
+    "bf16_replicate":
+        "grpo-math-code-B64G16-qwen3-30ba3b-instruct-non8-async-v3-rerun-pty",
 }
 METRICS = [
     "train/vllm/spec_acceptance_length",
@@ -64,8 +70,8 @@ METRICS = [
     # vLLM's own per-request split. The HTTP wall above accumulates per rollout
     # across every turn, so it inflates with tool-use depth even when decode
     # speed is unchanged; only the decode component is what speculation
-    # accelerates. Added in a later commit than the BF16 reference chain, which
-    # is why that chain has no decode series.
+    # accelerates. Landed partway through the original BF16 chain, so that one
+    # only carries the split from step 227; the replicate has it throughout.
     "train/vllm/request_decode_time_mean_s",
     "train/vllm/request_prefill_time_mean_s",
     "train/vllm/request_queue_time_mean_s",

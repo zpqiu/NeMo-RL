@@ -16,14 +16,15 @@
 
 Style and metric definitions follow `../fp8_rollout_30b/make_figures.py` so the
 two rollout-acceleration studies can be read side by side: orange = the BF16
-reference chain (no speculation), blue = the recommended config (online-trained
+reference (no speculation), blue = the recommended config (online-trained
 drafter), green = the ablation arm (frozen drafter). Noisy per-step series are
 smoothed with a centered rolling median (w=9).
 
-One deliberate addition to that style: the frozen arm is drawn dashed. Blue and
-green separate at deutan ΔE 23.5 but only 6.8 under tritanopia, and here they
-are the *primary* comparison rather than an ablation pair, so they carry a
-second, non-color encoding.
+Two deliberate additions. The frozen arm is drawn dashed: blue and green
+separate at deutan ΔE 23.5 but only 6.8 under tritanopia, and here they are the
+*primary* comparison rather than an ablation pair, so they carry a second,
+non-color encoding. And the BF16 replicate shares BF16's hue with a dotted
+stroke — it is the same entity sampled twice, and colour follows the entity.
 """
 
 from pathlib import Path
@@ -40,6 +41,9 @@ TEXT_SECONDARY = "#52514e"
 GRID = "#e8e7e3"
 # (alias, label, color, linestyle)
 BF16 = ("bf16", "BF16 (no speculation)", "#ff7f0e", "-")
+# Same entity as BF16, a second sample of it — so the same hue, distinguished by
+# stroke rather than by a fourth colour.
+BF16_REP = ("bf16_replicate", "BF16 replicate (same seed)", "#ff7f0e", ":")
 ONLINE = ("online", "EAGLE-3, drafter trained", "#1f77b4", "-")
 FROZEN = ("frozen", "EAGLE-3, drafter frozen", "#2ca02c", "--")
 
@@ -48,19 +52,23 @@ GEN_TOKENS = "train/math_code_harbor_agent/generated_tokens/mean"
 GEN_SEC = "train/math_code_harbor_agent/model_generation_sec/mean"
 DELTA = "acceptance_delta"
 
+# The no-speculation arms log acceptance_length as a constant 1.0 (no drafts),
+# which is true but flattens the panel's y-range, so the speculation panels are
+# restricted to the arms that actually speculate.
+SPEC_ONLY = {"online", "frozen"}
 RESULTS_PANELS = [
-    # (column, y-label, panel title, rolling-window)
-    (ACC, "tokens / draft", "Acceptance length", 9),
-    (DELTA, "Δ tokens / draft", "Acceptance advantage (trained − frozen)", 9),
-    ("validation/accuracy", "accuracy", "Validation accuracy (AIME 2025)", 1),
-    ("train/reward", "reward", "Training reward", 9),
-    ("train/approx_entropy", "approx. entropy", "Policy entropy", 9),
-    ("train/turns_per_sample/mean", "turns / sample", "Tool-use depth", 9),
+    # (column, y-label, panel title, rolling-window, alias filter or None)
+    (ACC, "tokens / draft", "Acceptance length", 9, SPEC_ONLY),
+    (DELTA, "Δ tokens / draft", "Acceptance advantage (trained − frozen)", 9, SPEC_ONLY),
+    ("validation/accuracy", "accuracy", "Validation accuracy (AIME 2025)", 1, None),
+    ("train/reward", "reward", "Training reward", 9, None),
+    ("train/approx_entropy", "approx. entropy", "Policy entropy", 9, None),
+    ("train/turns_per_sample/mean", "turns / sample", "Tool-use depth", 9, None),
 ]
 PERF_PANELS = [
-    ("decode_ms_per_token", "ms / token", "Decode time per output token", 9),
-    ("time_per_output_token_ms", "ms / token", "HTTP wall per output token", 9),
-    ("gen_kl_error_x1000", "KL x1000", "Mismatch KL (rollout vs training)", 9),
+    ("decode_ms_per_token", "ms / token", "Decode time per output token", 9, None),
+    ("time_per_output_token_ms", "ms / token", "HTTP wall per output token", 9, None),
+    ("gen_kl_error_x1000", "KL x1000", "Mismatch KL (rollout vs training)", 9, None),
 ]
 
 
@@ -75,9 +83,11 @@ def style_axes(ax):
     ax.tick_params(colors=TEXT_SECONDARY, labelsize=9)
 
 
-def plot_panel(ax, frames, chains, column, ylabel, title, window):
+def plot_panel(ax, frames, chains, column, ylabel, title, window, only=None):
     style_axes(ax)
     for alias, label, color, dash in chains:
+        if only is not None and alias not in only:
+            continue
         df = frames[alias]
         if column not in df.columns:
             continue
@@ -103,8 +113,8 @@ def render(frames, chains, panels, ncols, out_name, figsize):
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, dpi=150)
     fig.patch.set_facecolor(SURFACE)
     flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
-    for ax, (column, ylabel, title, window) in zip(flat, panels):
-        plot_panel(ax, frames, chains, column, ylabel, title, window)
+    for ax, (column, ylabel, title, window, only) in zip(flat, panels):
+        plot_panel(ax, frames, chains, column, ylabel, title, window, only)
     for ax in flat[len(panels):]:
         ax.set_visible(False)
     handles, labels = [], []
@@ -128,7 +138,7 @@ def render(frames, chains, panels, ncols, out_name, figsize):
 def main() -> None:
     FIG_DIR.mkdir(exist_ok=True)
     frames = {}
-    for alias, _, _, _ in (BF16, ONLINE, FROZEN):
+    for alias, _, _, _ in (BF16, BF16_REP, ONLINE, FROZEN):
         df = pd.read_csv(DATA_DIR / f"{alias}.csv")
         # Time per output token (ms/token), the tech report's rollout-perf
         # metric: mean model-call wall seconds / mean generated tokens per
@@ -142,7 +152,8 @@ def main() -> None:
         # tool-use depth even when decode speed is flat — the frozen arm's jump to
         # ~14 ms/token after its step-195 transition is entirely that, its decode
         # cost is unchanged. The per-request metrics landed partway through the
-        # BF16 chain, so that arm only carries this series from step 227 on.
+        # original BF16 chain, so it only carries this series from step 227; the
+        # replicate has it from step 1 and is the usable no-speculation baseline.
         if "train/vllm/request_decode_time_mean_s" in df.columns:
             tokens_per_call = (df[GEN_TOKENS]
                                / df["train/math_code_harbor_agent/num_model_calls/mean"])
@@ -161,20 +172,20 @@ def main() -> None:
     frames["online"] = frames["online"].merge(paired[["step", DELTA]], on="step",
                                               how="left")
 
-    render(frames, (ONLINE, FROZEN, BF16), RESULTS_PANELS, 3,
-           "results_dynamics.svg", (12.8, 6.4))
-    render(frames, (ONLINE, FROZEN, BF16), PERF_PANELS, 3,
-           "rollout_perf.svg", (14.0, 3.9))
+    render(frames, (ONLINE, FROZEN, BF16, BF16_REP), RESULTS_PANELS, 3,
+           "results_dynamics.svg", (12.8, 6.6))
+    render(frames, (ONLINE, FROZEN, BF16, BF16_REP), PERF_PANELS, 3,
+           "rollout_perf.svg", (14.0, 4.1))
 
     # Windowed medians for the report text (matched-load comparisons).
-    print("\n| window | metric | trained | frozen | BF16 |")
+    print("\n| window | metric | trained | frozen | BF16 replicate |")
     print("|---|---|---|---|---|")
     for name, lo, hi in [("steps 10-60", 10, 60), ("steps 150-190", 150, 190),
                          ("steps 200-221", 200, 221)]:
         for col, label in (("decode_ms_per_token", "decode ms/token"),
                            ("time_per_output_token_ms", "HTTP ms/token")):
             cells = []
-            for alias, _, _, _ in (ONLINE, FROZEN, BF16):
+            for alias, _, _, _ in (ONLINE, FROZEN, BF16_REP):
                 win = frames[alias]
                 win = win[(win["step"] >= lo) & (win["step"] <= hi)]
                 val = win[col].median() if col in win.columns else float("nan")
