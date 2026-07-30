@@ -192,7 +192,7 @@ this feature on a MoE policy, since it forfeits permute fusion.
 
 ## Caveats
 
-- **The arms diverge behaviorally, and a replicate shows that is intrinsic.**
+- **The arms diverge behaviorally, and the cause is UNRESOLVED.**
   This workload has a heavy-tool phase transition whose timing and plateau vary
   enormously run to run. A byte-identical replicate of the BF16 chain — same
   config, same `grpo.seed=42`, differing only in async nondeterminism —
@@ -205,11 +205,16 @@ this feature on a MoE policy, since it forfeits permute fusion.
   | EAGLE-3, trained | off | 77 | 9.7 | 0.2989 |
   | EAGLE-3, frozen | off | 194 | 15.7 | 0.2936 |
 
-  The two BF16 samples bracket both eagle arms on every column. So neither the
-  tool-use divergence nor the entropy gap can be read as an effect of
-  speculative decoding — and the entropy gap in particular is *not* explained by
-  sequence packing, which was the earlier hypothesis: the replicate runs packing
-  **on** and still sits at 0.2866, below both packing-off eagle arms.
+  The two BF16 samples bracket both eagle arms on every column, which does rule
+  out two specific attributions: the spread is not an effect of speculative
+  decoding, and it is not explained by sequence packing (the replicate runs
+  packing **on** and still lands at 0.2866, below both packing-off eagle arms).
+  **What it does not do is explain the spread.** Two samples cannot characterise
+  a variance, and "run-to-run variance" names the observation rather than a
+  mechanism. Why byte-identical configs at the same seed separate this far —
+  whether async rollout ordering seeds a bifurcation at the tool-use transition,
+  or something systematic differs between runs — is open, and the numbers below
+  should be read as descriptive until it is settled.
 - **The behavioral divergence also cannot account for the acceptance result**,
   independently of the above. Each arm's own transition bounds it as a natural
   experiment: across the frozen arm's transition its tool-use depth grows
